@@ -126,6 +126,22 @@ export default function ClientsList() {
                           {client.name}
                         </Link>
                         <div style={{fontSize:'0.75rem',color:'#94a3b8',marginTop:'2px'}}>{client.email}</div>
+                        {/* كود استرجاع الباسورد */}
+                        {client.pendingResetOTP && (() => {
+                          return (
+                            <div style={{ marginTop:4, display:'flex', alignItems:'center', gap:6 }}>
+                              <span style={{ background:'#fff7ed', color:'#d97706', border:'1px solid #fde68a', borderRadius:6, padding:'2px 8px', fontSize:'0.75rem', fontWeight:700 }}>
+                                🔑 {client.pendingResetOTP}
+                              </span>
+                              <a href={`https://wa.me/96550771847?text=${encodeURIComponent(`مرحباً ${client.name}،\nكود إعادة تعيين كلمة المرور: *${client.pendingResetOTP}*\n🔑`)}`}
+                                target="_blank" rel="noreferrer"
+                                style={{ background:'#25D366', color:'white', borderRadius:6, padding:'2px 8px', fontSize:'0.72rem', fontWeight:700, textDecoration:'none' }}
+                                onClick={e => e.stopPropagation()}>
+                                💬
+                              </a>
+                            </div>
+                          );
+                        })()}
                       </td>
                       <td>{client.phone}</td>
                       <td>

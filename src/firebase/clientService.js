@@ -1,51 +1,56 @@
-import { db } from './config';
 import {
   collection,
-  addDoc,
   getDocs,
-  doc,
+  addDoc,
   deleteDoc,
-  query,
-  orderBy,
-  serverTimestamp,
+  doc,
   updateDoc,
-  getDoc
-} from 'firebase/firestore';
+  getDoc,
+  query,
+  orderBy
+} from "firebase/firestore";
+import { db } from "./config";
 
-const CLIENTS_COLLECTION = 'clients';
+const CLIENTS_COLLECTION = "clients";
 
-// إضافة عميل جديد
+// Get all clients
+export const getClients = async () => {
+  const q = query(collection(db, CLIENTS_COLLECTION), orderBy("createdAt", "desc"));
+  const snapshot = await getDocs(q);
+  return snapshot.docs.map((docSnap) => ({
+    id: docSnap.id,
+    ...docSnap.data(),
+  }));
+};
+
+// Get single client
+export const getClientById = async (id) => {
+  const ref = doc(db, CLIENTS_COLLECTION, id);
+  const snap = await getDoc(ref);
+  if (!snap.exists()) return null;
+  return {
+    id: snap.id,
+    ...snap.data(),
+  };
+};
+
+// Add client
 export const addClient = async (clientData) => {
   const docRef = await addDoc(collection(db, CLIENTS_COLLECTION), {
     ...clientData,
-    createdAt: serverTimestamp(),
+    createdAt: new Date(),
   });
   return docRef.id;
 };
 
-// جلب كل العملاء
-export const getClients = async () => {
-  const q = query(collection(db, CLIENTS_COLLECTION), orderBy('createdAt', 'desc'));
-  const snapshot = await getDocs(q);
-  return snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+// Update client
+export const updateClient = async (id, updatedData) => {
+  const ref = doc(db, CLIENTS_COLLECTION, id);
+  await updateDoc(ref, updatedData);
 };
 
-// جلب عميل بالـ ID
-export const getClientById = async (clientId) => {
-  const docRef = doc(db, CLIENTS_COLLECTION, clientId);
-  const snapshot = await getDoc(docRef);
-  if (snapshot.exists()) {
-    return { id: snapshot.id, ...snapshot.data() };
-  }
-  return null;
-};
-
-// حذف عميل
-export const deleteClient = async (clientId) => {
-  await deleteDoc(doc(db, CLIENTS_COLLECTION, clientId));
-};
-
-// تحديث عميل
-export const updateClient = async (clientId, data) => {
-  await updateDoc(doc(db, CLIENTS_COLLECTION, clientId), data);
+// Delete client
+export const deleteClient = async (id) => {
+  const ref = doc(db, CLIENTS_COLLECTION, id);
+  await deleteDoc(ref);
 };

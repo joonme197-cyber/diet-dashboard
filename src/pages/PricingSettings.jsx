@@ -1,16 +1,23 @@
 import { useState, useEffect } from 'react';
-import { getPricingSettings, savePricingSettings, DEFAULT_PRICING } from '../firebase/pricingService';
+import { getPricingSettings, savePricingSettings, DEFAULT_PRICING, getFlexSettings, saveFlexSettings, DEFAULT_FLEX_SETTINGS, DURATION_OPTIONS } from '../firebase/pricingService';
 import { useLang } from '../LanguageContext';
 
 export default function PricingSettings() {
   const { isAr } = useLang();
-  const [pricing, setPricing] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [saving, setSaving]   = useState(false);
-  const [msg, setMsg]         = useState('');
+  const [pricing, setPricing]           = useState(null);
+  const [loading, setLoading]           = useState(true);
+  const [saving, setSaving]             = useState(false);
+  const [msg, setMsg]                   = useState('');
+  const [flexSettings, setFlexSettings] = useState(DEFAULT_FLEX_SETTINGS);
+  const [savingFlex, setSavingFlex]     = useState(false);
+  const [msgFlex, setMsgFlex]           = useState('');
 
   useEffect(() => {
-    getPricingSettings().then(p => { setPricing(p); setLoading(false); });
+    Promise.all([getPricingSettings(), getFlexSettings()]).then(([p, f]) => {
+      setPricing(p);
+      setFlexSettings(f);
+      setLoading(false);
+    });
   }, []);
 
   const update = (k, v) => setPricing(p => ({ ...p, [k]: parseFloat(v) || 0 }));
@@ -25,6 +32,23 @@ export default function PricingSettings() {
 
   const handleReset = () => {
     setPricing({ ...DEFAULT_PRICING });
+  };
+
+  const handleSaveFlex = async () => {
+    setSavingFlex(true);
+    await saveFlexSettings(flexSettings);
+    setSavingFlex(false);
+    setMsgFlex('✅ ' + (isAr ? 'تم حفظ إعدادات الباقة المرنة' : 'Flex settings saved successfully'));
+    setTimeout(() => setMsgFlex(''), 2500);
+  };
+
+  const updateFlex = (k, v) => setFlexSettings(f => ({ ...f, [k]: v }));
+
+  const toggleFlexArray = (key, val) => {
+    setFlexSettings(f => {
+      const arr = f[key] || [];
+      return { ...f, [key]: arr.includes(val) ? arr.filter(x => x !== val) : [...arr, val].sort((a, b) => a - b) };
+    });
   };
 
   // مثال حساب لعرض تأثير الأسعار
@@ -263,6 +287,166 @@ export default function PricingSettings() {
                   </div>
                 </div>
               )}
+            </div>
+          </div>
+        </div>
+
+        {/* ── إعدادات الباقة المرنة ── */}
+        <div className="card" style={{ marginTop: '28px' }}>
+          <div className="card-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <h3>⚙️ {isAr ? 'إعدادات الباقة المرنة' : 'Flex Package Settings'}</h3>
+            <button className="btn btn-primary" onClick={handleSaveFlex} disabled={savingFlex}>
+              {savingFlex ? (isAr ? 'جاري الحفظ...' : 'Saving...') : `💾 ${isAr ? 'حفظ الإعدادات' : 'Save Settings'}`}
+            </button>
+          </div>
+          {msgFlex && <div style={{ margin: '0 24px' }}><div className="alert alert-success fade-in">{msgFlex}</div></div>}
+          <div className="card-body">
+            {/* Toggle إظهار في موقع العميل */}
+            <div onClick={() => updateFlex('showOnWebsite', !flexSettings.showOnWebsite)}
+              style={{
+                display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                padding: '14px 18px', borderRadius: '12px', marginBottom: '20px', cursor: 'pointer',
+                border: `2px solid ${flexSettings.showOnWebsite ? '#0d9488' : '#e2e8f0'}`,
+                background: flexSettings.showOnWebsite ? '#f0fdfa' : '#f8fafc',
+                transition: 'all 0.2s',
+              }}>
+              <div>
+                <div style={{ fontWeight: 700, fontSize: '0.95rem', color: flexSettings.showOnWebsite ? '#0d9488' : '#374151' }}>
+                  🌐 {isAr ? 'إظهار الباقة المرنة في موقع العميل' : 'Show Flex Package on Client Website'}
+                </div>
+                <div style={{ fontSize: '0.78rem', color: '#94a3b8', marginTop: 3 }}>
+                  {isAr ? 'عند التفعيل ستظهر كارد الباقة المرنة في صفحة الباقات' : 'When enabled, flex package card appears on the packages page'}
+                </div>
+              </div>
+              <div style={{
+                width: 48, height: 26, borderRadius: 999, position: 'relative', flexShrink: 0,
+                background: flexSettings.showOnWebsite ? '#0d9488' : '#cbd5e1',
+                transition: 'background 0.2s',
+              }}>
+                <div style={{
+                  position: 'absolute', top: 3, width: 20, height: 20, borderRadius: '50%', background: 'white',
+                  transition: 'left 0.2s',
+                  left: flexSettings.showOnWebsite ? 25 : 3,
+                  boxShadow: '0 1px 4px rgba(0,0,0,0.2)',
+                }} />
+              </div>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '16px', marginBottom: '20px' }}>
+              {[
+                { key: 'minDaysPerWeek',  ar: 'أقل أيام في الأسبوع',  en: 'Min Days / Week',     min: 1,  max: 6   },
+                { key: 'maxDaysPerWeek',  ar: 'أكثر أيام في الأسبوع', en: 'Max Days / Week',     min: 1,  max: 6   },
+                { key: 'minMealsPerDay',  ar: 'أقل وجبات في اليوم',   en: 'Min Meals / Day',     min: 1,  max: 5   },
+                { key: 'maxMealsPerDay',  ar: 'أكثر وجبات في اليوم',  en: 'Max Meals / Day',     min: 1,  max: 5   },
+                { key: 'minSnacks',       ar: 'أقل سناك',             en: 'Min Snacks',           min: 0,  max: 3   },
+                { key: 'maxSnacks',       ar: 'أكثر سناك',            en: 'Max Snacks',           min: 0,  max: 3   },
+              ].map(item => (
+                <div key={item.key} style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                  <label style={{ fontWeight: 600, fontSize: '0.85rem', color: '#374151' }}>
+                    {isAr ? item.ar : item.en}
+                  </label>
+                  <input
+                    type="number"
+                    min={item.min}
+                    max={item.max}
+                    value={flexSettings[item.key] ?? item.min}
+                    onChange={e => updateFlex(item.key, Number(e.target.value))}
+                    style={{
+                      padding: '8px 12px', border: '1.5px solid #e2e8f0', borderRadius: '8px',
+                      fontFamily: 'var(--font-main)', fontSize: '0.95rem', fontWeight: 700,
+                      textAlign: 'center', outline: 'none', width: '100%',
+                    }}
+                  />
+                </div>
+              ))}
+            </div>
+
+            {/* أيام التجميد */}
+            <div style={{ marginBottom: '20px' }}>
+              <div style={{ fontWeight: 700, fontSize: '0.88rem', marginBottom: '8px', color: '#374151' }}>
+                ❄️ {isAr ? 'أقصى أيام التجميد المسموحة' : 'Max Freeze Days Allowed'}
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <input
+                  type="number"
+                  min={0}
+                  max={90}
+                  value={flexSettings.maxFreezeDays ?? 0}
+                  onChange={e => updateFlex('maxFreezeDays', Number(e.target.value))}
+                  style={{
+                    width: '100px', padding: '8px 12px', border: '1.5px solid #e2e8f0', borderRadius: '8px',
+                    fontFamily: 'var(--font-main)', fontSize: '0.95rem', fontWeight: 700,
+                    textAlign: 'center', outline: 'none',
+                  }}
+                />
+                <span style={{ fontSize: '0.85rem', color: '#64748b' }}>{isAr ? 'يوم' : 'days'}</span>
+                <span style={{ fontSize: '0.78rem', color: '#94a3b8' }}>
+                  {isAr ? '(0 = التجميد غير مسموح)' : '(0 = freeze not allowed)'}
+                </span>
+              </div>
+            </div>
+
+            {/* Allowed Durations */}
+            <div style={{ marginBottom: '16px' }}>
+              <div style={{ fontWeight: 700, fontSize: '0.88rem', marginBottom: '10px', color: '#374151' }}>
+                {isAr ? 'مدد الاشتراك المسموحة' : 'Allowed Durations'}
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px' }}>
+                {DURATION_OPTIONS.map(opt => (
+                  <label key={opt.days} style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', userSelect: 'none',
+                    padding: '6px 14px', borderRadius: '8px', border: '1.5px solid',
+                    borderColor: (flexSettings.allowedDurations || []).includes(opt.days) ? '#0d9488' : '#e2e8f0',
+                    background: (flexSettings.allowedDurations || []).includes(opt.days) ? '#f0fdfa' : 'white',
+                    transition: 'all 0.15s',
+                  }}>
+                    <input
+                      type="checkbox"
+                      checked={(flexSettings.allowedDurations || []).includes(opt.days)}
+                      onChange={() => toggleFlexArray('allowedDurations', opt.days)}
+                      style={{ accentColor: '#0d9488' }}
+                    />
+                    <span style={{ fontWeight: 600, fontSize: '0.88rem' }}>{opt.label}</span>
+                    <span style={{ fontSize: '0.75rem', color: '#94a3b8' }}>({opt.days}d)</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            {/* Allowed Protein */}
+            <div style={{ marginBottom: '16px' }}>
+              <div style={{ fontWeight: 700, fontSize: '0.88rem', marginBottom: '10px', color: '#374151' }}>
+                {isAr ? 'قيم البروتين المسموحة (جرام)' : 'Allowed Protein Values (g)'}
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px' }}>
+                {[80, 90, 100, 120, 150, 180, 200].map(val => (
+                  <label key={val} style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', userSelect: 'none' }}>
+                    <input
+                      type="checkbox"
+                      checked={(flexSettings.allowedProtein || []).includes(val)}
+                      onChange={() => toggleFlexArray('allowedProtein', val)}
+                    />
+                    <span style={{ fontWeight: 600, fontSize: '0.9rem' }}>{val}g</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            {/* Allowed Carbs */}
+            <div>
+              <div style={{ fontWeight: 700, fontSize: '0.88rem', marginBottom: '10px', color: '#374151' }}>
+                {isAr ? 'قيم الكارب المسموحة (جرام)' : 'Allowed Carbs Values (g)'}
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px' }}>
+                {[50, 80, 100, 120, 150, 200].map(val => (
+                  <label key={val} style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer', userSelect: 'none' }}>
+                    <input
+                      type="checkbox"
+                      checked={(flexSettings.allowedCarbs || []).includes(val)}
+                      onChange={() => toggleFlexArray('allowedCarbs', val)}
+                    />
+                    <span style={{ fontWeight: 600, fontSize: '0.9rem' }}>{val}g</span>
+                  </label>
+                ))}
+              </div>
             </div>
           </div>
         </div>

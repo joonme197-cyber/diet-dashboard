@@ -8,12 +8,30 @@ import {
   getRenewalSettings, saveRenewalSettings
 } from '../firebase/subscriptionService';
 import { getPackages } from '../firebase/packageService';
-import { REGIONS_DATA } from '../LanguageContext';
+import { REGIONS_DATA } from '../LanguageContext'; // fallback
+import { useGovernorates } from '../hooks/useGovernorates';
 import {
   MEALS_DATA, getMenuDay, saveClientDailyMeals, getClientDailyMeals,
 } from '../firebase/mealService';
+import { runAutoSelectForClient } from '../firebase/autoSelectService';
+import * as XLSX from 'xlsx';
 
 const PAYMENT_METHODS = ['كاش', 'Knet', 'Visa/Mastercard', 'رابط WhatsApp', 'آجل'];
+
+const DURATION_OPTIONS = [
+  { label: '1 يوم',      weeks: 0,  days: 1   },
+  { label: '1 أسبوع',    weeks: 1,  days: 7   },
+  { label: '2 أسبوع',    weeks: 2,  days: 14  },
+  { label: '3 أسابيع',   weeks: 3,  days: 21  },
+  { label: '20 يوم',     weeks: 0,  days: 20  },
+  { label: '26 يوم',     weeks: 0,  days: 26  },
+  { label: '1 شهر',      weeks: 4,  days: 28  },
+  { label: '5 أسابيع',   weeks: 5,  days: 35  },
+  { label: '6 أسابيع',   weeks: 6,  days: 42  },
+  { label: '2 شهر',      weeks: 8,  days: 56  },
+  { label: '3 شهور',     weeks: 12, days: 84  },
+  { label: 'مخصص',       weeks: 0,  days: 0   },
+];
 const MEAL_SECTIONS = [
   { key: 'افطار', label: 'الفطور',  icon: '🍳' },
   { key: 'غداء',  label: 'الغداء',  icon: '🍛' },
@@ -46,6 +64,7 @@ const GOVERNORATES = [
 export default function ClientProfile() {
   const { clientId } = useParams();
   const navigate = useNavigate();
+  const { governorates: govData } = useGovernorates();
   const [client, setClient]           = useState(null);
   const [subscriptions, setSubscriptions] = useState([]);
   const [packages, setPackages]       = useState([]);
@@ -84,7 +103,7 @@ export default function ClientProfile() {
   // Forms
   const emptySubForm = {
     packageId: '', packageName: '', bundleType: 'normal',
-    startDate: '', endDate: '', durationWeeks: 4,
+    startDate: '', endDate: '', durationWeeks: 4, durationDays: null,
     protein: '150', carbs: '100',
     mealsNumber: 3, snacksNumber: 1,
     allowedBreakfast: 2, allowedLunch: 2, allowedDinner: 2,
@@ -136,10 +155,10 @@ export default function ClientProfile() {
 
   const showMsg = (m) => { setMsg(m); setTimeout(() => setMsg(''), 2500); };
 
-  const calcEndDate = (start, weeks) => {
+  const calcEndDate = (start, weeks, days = null) => {
     if (!start) return '';
     const d = new Date(start);
-    d.setDate(d.getDate() + weeks * 7);
+    d.setDate(d.getDate() + (days != null ? days : (weeks || 0) * 7));
     return d.toISOString().split('T')[0];
   };
 
@@ -173,11 +192,11 @@ export default function ClientProfile() {
     showMsg('✅ تم تحديث بيانات العميل');
   };
 
-  // مناطق المحافظة المختارة
-  const selectedGovData = REGIONS_DATA.find(g =>
+  // مناطق المحافظة المختارة — من Firestore
+  const selectedGovData = govData.find(g =>
     g.nameAr === clientForm.governorate || g.nameEn === clientForm.governorate
   );
-  const regions = selectedGovData?.regions || [];
+  const regions = (selectedGovData?.regions || []).filter(r => r.active !== false);
 
   const handleAction = async (action) => {
     const active = subscriptions.find(s => getSubscriptionStatus(s) === 'active');
@@ -221,14 +240,14 @@ export default function ClientProfile() {
   const handleAddSub = async () => {
     if (!subForm.startDate) { alert('تاريخ البدء مطلوب'); return; }
     const pkg = packages.find(p => p.id === subForm.packageId);
-    const endDate = calcEndDate(subForm.startDate, subForm.durationWeeks);
+    const endDate = calcEndDate(subForm.startDate, subForm.durationWeeks, subForm.durationDays);
     await addSubscription({
       clientId, clientName: client?.name,
       packageId: subForm.packageId,
       packageName: pkg?.nameAr || 'باقة مخصصة',
       bundleType: subForm.bundleType,
       startDate: subForm.startDate, endDate,
-      durationWeeks: subForm.durationWeeks,
+      durationWeeks: subForm.durationWeeks, durationDays: subForm.durationDays,
       protein: subForm.protein, carbs: subForm.carbs,
       mealsNumber: subForm.mealsNumber, snacksNumber: subForm.snacksNumber,
       allowedBreakfast: subForm.allowedBreakfast,
@@ -262,7 +281,10 @@ export default function ClientProfile() {
     const frozen = selectedSub.frozenDays || [];
     if (frozen.includes(dateStr)) {
       await unFreezeDay(selectedSub.id, dateStr);
-      showMsg(`تم إلغاء تجميد ${dateStr}`);
+      showMsg(`تم إلغاء تجميد ${dateStr} — جاري تحديث وجباته...`);
+      // بعد إلغاء التجميد، تأكد إن العميل عنده وجبات لهذا اليوم
+      const updatedSub = { ...selectedSub, frozenDays: frozen.filter(d => d !== dateStr) };
+      runAutoSelectForClient(clientId, dateStr, updatedSub).catch(() => {});
     } else {
       await freezeDay(selectedSub.id, dateStr);
       showMsg(`تم تجميد ${dateStr} ❄`);
@@ -376,9 +398,14 @@ export default function ClientProfile() {
   };
 
   const getMealLimit = (type, mealSub) => {
-    // للتطبيق والكرون فقط — الداش بورد حر
+    // هذه الدالة للتطبيق والكرون فقط — الداش بورد حر
     if (!mealSub) return 99;
-
+    const limits = {
+      'افطار': mealSub.allowedBreakfast ?? mealSub.mealsNumber ?? 99,
+      'غداء':  mealSub.allowedLunch     ?? mealSub.mealsNumber ?? 99,
+      'عشاء':  mealSub.allowedDinner    ?? mealSub.mealsNumber ?? 99,
+      'سناك':  mealSub.snacksNumber     ?? 99,
+    };
     const allowed = {
       'افطار': mealSub.allowBreakfast !== false,
       'غداء':  mealSub.allowLunch     !== false,
@@ -386,25 +413,8 @@ export default function ClientProfile() {
       'سناك':  mealSub.allowSnacks    !== false,
     };
     if (!allowed[type]) return 0;
-
-    if (type === 'سناك') return mealSub.snacksNumber ?? 99;
-
-    // للباقة الثابتة: فيها حدود منفصلة لكل نوع
-    if (mealSub.bundleType === 'normal') {
-      if (type === 'افطار') return mealSub.allowedBreakfast ?? mealSub.mealsNumber ?? 99;
-      if (type === 'غداء')  return mealSub.allowedLunch     ?? mealSub.mealsNumber ?? 99;
-      if (type === 'عشاء')  return mealSub.allowedDinner    ?? mealSub.mealsNumber ?? 99;
-    }
-
-    // للباقة المرنة: mealsNumber هو الحد الكلي للوجبات (غير السناك)
-    // كل نوع مسموح يشارك في نفس الحد الكلي
-    return mealSub.mealsNumber ?? 99;
+    return limits[type];
   };
-
-  // حساب الوجبات الكلي بدون السناك (للباقة المرنة)
-  const totalMealsWithoutSnacks = Object.entries(clientMeals)
-    .filter(([key]) => key !== 'سناك')
-    .reduce((s, [, arr]) => s + arr.length, 0);
 
   // الأدمن حر تماماً — toggleMeal بدون قيود
   const toggleMeal = (meal) => {
@@ -542,6 +552,113 @@ export default function ClientProfile() {
   const upcomingSubs = subscriptions.filter(s => getSubscriptionStatus(s) === 'upcoming');
   const expiredSubs  = subscriptions.filter(s => ['expired','cancelled'].includes(getSubscriptionStatus(s)));
 
+  // ── جمع بيانات الوجبات لاشتراك ──
+  const fetchMealsData = async (sub) => {
+    const rows = [];
+    const DAYS = ['الأحد','الاثنين','الثلاثاء','الأربعاء','الخميس','الجمعة','السبت'];
+    const start = new Date(sub.startDate);
+    const end   = new Date(sub.endDate);
+    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+      const dateStr  = d.toISOString().split('T')[0];
+      const isFrozen = (sub.frozenDays || []).includes(dateStr);
+      const dayName  = DAYS[d.getDay()];
+      if (isFrozen) {
+        rows.push({ dateStr, dayName, frozen: true, breakfast:'', lunch:'', dinner:'', snacks:'', total:0 });
+        continue;
+      }
+      const meals    = await getClientDailyMeals(client.id, dateStr);
+      const breakfast = (meals?.افطار || []).map(m => m.title).join(' / ') || '—';
+      const lunch     = (meals?.غداء  || []).map(m => m.title).join(' / ') || '—';
+      const dinner    = (meals?.عشاء  || []).map(m => m.title).join(' / ') || '—';
+      const snacks    = (meals?.سناك  || []).map(m => m.title).join(' / ') || '—';
+      const total     = (meals?.افطار?.length||0)+(meals?.غداء?.length||0)+(meals?.عشاء?.length||0)+(meals?.سناك?.length||0);
+      rows.push({ dateStr, dayName, frozen:false, breakfast, lunch, dinner, snacks, total });
+    }
+    return rows;
+  };
+
+  // ── تقرير Excel ──
+  const generateMealsExcel = async (sub) => {
+    if (!sub?.startDate) return;
+    const data = await fetchMealsData(sub);
+    const wb   = XLSX.utils.book_new();
+    const aoa  = [
+      [`تقرير اختيارات وجبات العميل: ${client.name} — ${client.clientCode}`],
+      [`الباقة: ${sub.packageName}`, '', `من: ${sub.startDate}`, `إلى: ${sub.endDate}`],
+      [],
+      ['التاريخ','اليوم','الفطور','الغداء','العشاء','السناك','إجمالي'],
+      ...data.map(r => r.frozen
+        ? [r.dateStr, r.dayName, '❄ مجمد', '', '', '', 0]
+        : [r.dateStr, r.dayName, r.breakfast, r.lunch, r.dinner, r.snacks, r.total]
+      ),
+      [],
+      ['📊 ملخص'],
+      ['إجمالي الأيام', data.length],
+      ['أيام التجميد', data.filter(r=>r.frozen).length],
+      ['أيام التوصيل', data.filter(r=>!r.frozen).length],
+    ];
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    ws['!cols'] = [{wch:14},{wch:12},{wch:30},{wch:30},{wch:30},{wch:20},{wch:8}];
+    XLSX.utils.book_append_sheet(wb, ws, 'تقرير الوجبات');
+    XLSX.writeFile(wb, `meals_${client.clientCode}_${sub.startDate}.xlsx`);
+  };
+
+  // ── تقرير PDF (طباعة) ──
+  const generateMealsPDF = async (sub) => {
+    if (!sub?.startDate) return;
+    const data = await fetchMealsData(sub);
+
+    const rows = data.map((r, i) => `
+      <tr style="background:${r.frozen?'#fef3c7':i%2===0?'#fff':'#f8fafc'}">
+        <td>${r.dateStr}</td>
+        <td>${r.dayName}</td>
+        ${r.frozen
+          ? `<td colspan="4" style="text-align:center;color:#d97706;font-weight:700">❄ يوم مجمد</td><td>0</td>`
+          : `<td>${r.breakfast}</td><td>${r.lunch}</td><td>${r.dinner}</td><td>${r.snacks}</td><td style="text-align:center;font-weight:700">${r.total}</td>`
+        }
+      </tr>`).join('');
+
+    const html = `
+      <!DOCTYPE html><html dir="rtl" lang="ar">
+      <head><meta charset="UTF-8">
+      <style>
+        body { font-family: 'Cairo', Arial, sans-serif; margin: 20px; color: #1e293b; }
+        h1 { color: #0d9488; font-size: 18px; margin-bottom: 4px; }
+        .sub { color: #64748b; font-size: 13px; margin-bottom: 16px; }
+        table { width: 100%; border-collapse: collapse; font-size: 11px; }
+        th { background: #0d9488; color: white; padding: 8px 10px; text-align: right; border: 1px solid #0a7a6e; }
+        td { padding: 6px 10px; border: 1px solid #e2e8f0; text-align: right; }
+        .summary { margin-top: 20px; padding: 12px; background: #f0fdfa; border-radius: 8px; border: 1px solid #ccfbf1; font-size: 12px; }
+        .summary span { margin-left: 20px; font-weight: 700; color: #0d9488; }
+        @page { size: A4; margin: 12mm; }
+      </style></head>
+      <body>
+        <h1>🥗 تقرير اختيارات وجبات العميل</h1>
+        <div class="sub">
+          العميل: <strong>${client.name}</strong> — الكود: <strong>${client.clientCode}</strong><br/>
+          الباقة: <strong>${sub.packageName}</strong> | من: <strong>${sub.startDate}</strong> إلى: <strong>${sub.endDate}</strong>
+          ${sub.couponCode ? `<br/>كوبون: <strong>${sub.couponCode}</strong> — خصم: <strong>${Number(sub.discountAmount||0).toFixed(3)} KWD</strong>` : ''}
+        </div>
+        <table>
+          <thead><tr>
+            <th>التاريخ</th><th>اليوم</th><th>الفطور</th><th>الغداء</th><th>العشاء</th><th>السناك</th><th>المجموع</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+        <div class="summary">
+          <span>إجمالي الأيام: ${data.length}</span>
+          <span>أيام التجميد: ${data.filter(r=>r.frozen).length}</span>
+          <span>أيام التوصيل: ${data.filter(r=>!r.frozen).length}</span>
+          ${sub.bonusDays > 0 ? `<span>🎁 أيام تعويض: ${sub.bonusDays}</span>` : ''}
+        </div>
+      </body></html>`;
+
+    const win = window.open('', '_blank');
+    win.document.write(html);
+    win.document.close();
+    win.onload = () => { win.print(); };
+  };
+
   return (
     <div>
       <div className="page-header no-print">
@@ -551,9 +668,22 @@ export default function ClientProfile() {
             <Link to="/clients" style={{ color: 'var(--text-muted)' }}>العملاء</Link> / {client.name}
           </div>
         </div>
-        <button className="btn btn-primary" onClick={() => { setSubForm(emptySubForm); setShowAddSub(true); }}>
-          + اشتراك جديد
-        </button>
+        <div style={{ display:'flex', gap:'10px' }}>
+          {activeSub && (<>
+            <button className="btn btn-outline" onClick={() => generateMealsExcel(activeSub)} title="تنزيل Excel">
+              📊 Excel
+            </button>
+            <button className="btn btn-outline" onClick={() => generateMealsPDF(activeSub)} title="طباعة PDF">
+              🖨️ PDF
+            </button>
+          </>)}
+          <button className="btn btn-ghost" onClick={() => load()} title="تحديث البيانات">
+            🔄
+          </button>
+          <button className="btn btn-primary" onClick={() => { setSubForm(emptySubForm); setShowAddSub(true); }}>
+            + اشتراك جديد
+          </button>
+        </div>
       </div>
 
       {msg && <div style={{ margin: '0 32px' }}><div className="alert alert-success fade-in">{msg}</div></div>}
@@ -635,19 +765,19 @@ export default function ClientProfile() {
             {activeSub && (
               <div style={{ marginBottom: '16px' }}>
                 <div className="section-title">الاشتراك النشط</div>
-                <SubCard sub={activeSub} onCalendar={() => { setSelectedSub(activeSub); setActiveTab('التقويم'); }} />
+                <SubCard sub={activeSub} onCalendar={() => { setSelectedSub(activeSub); setActiveTab('التقويم'); }} onExcel={generateMealsExcel} onPDF={generateMealsPDF} />
               </div>
             )}
             {upcomingSubs.length > 0 && (
               <div style={{ marginBottom: '16px' }}>
                 <div className="section-title">الاشتراكات القادمة</div>
-                {upcomingSubs.map(s => <SubCard key={s.id} sub={s} />)}
+                {upcomingSubs.map(s => <SubCard key={s.id} sub={s} onExcel={generateMealsExcel} onPDF={generateMealsPDF} />)}
               </div>
             )}
             {expiredSubs.length > 0 && (
               <div>
                 <div className="section-title">السجل السابق</div>
-                {expiredSubs.map(s => <SubCard key={s.id} sub={s} />)}
+                {expiredSubs.map(s => <SubCard key={s.id} sub={s} onExcel={generateMealsExcel} onPDF={generateMealsPDF} />)}
               </div>
             )}
             {subscriptions.length === 0 && (
@@ -715,46 +845,36 @@ export default function ClientProfile() {
                             📊 إعدادات الباقة — {mealSub.packageName}
                           </span>
                           <span style={{ fontSize:'0.72rem', color:'#94a3b8', background:'#f1f5f9', padding:'2px 8px', borderRadius:'999px' }}>
-                            للمرجع فقط — الأدمن حر
+                            للمرجع فقط — الأدمن حر في الاختيار
                           </span>
                         </div>
                         <div style={{ display:'flex', gap:'8px', flexWrap:'wrap' }}>
                           {[
-                            { key:'افطار', label:'الفطور', icon:'🍳' },
-                            { key:'غداء',  label:'الغداء', icon:'🍛' },
-                            { key:'عشاء',  label:'العشاء', icon:'🌙' },
-                            { key:'سناك',  label:'السناك', icon:'🥗' },
-                          ].map(({ key, label, icon }) => {
+                            { key:'افطار', label:'الفطور', icon:'🍳',
+                              limit: mealSub.allowBreakfast !== false ? (mealSub.allowedBreakfast ?? mealSub.mealsNumber ?? '∞') : null },
+                            { key:'غداء',  label:'الغداء', icon:'🍛',
+                              limit: mealSub.allowLunch    !== false ? (mealSub.allowedLunch    ?? mealSub.mealsNumber ?? '∞') : null },
+                            { key:'عشاء',  label:'العشاء', icon:'🌙',
+                              limit: mealSub.allowDinner   !== false ? (mealSub.allowedDinner   ?? mealSub.mealsNumber ?? '∞') : null },
+                            { key:'سناك',  label:'السناك', icon:'🥗',
+                              limit: mealSub.allowSnacks   !== false ? (mealSub.snacksNumber    ?? '∞') : null },
+                          ].map(({ key, label, icon, limit }) => {
                             const selected = (clientMeals[key] || []).length;
-                            const allowed = { 'افطار': mealSub.allowBreakfast !== false, 'غداء': mealSub.allowLunch !== false, 'عشاء': mealSub.allowDinner !== false, 'سناك': mealSub.allowSnacks !== false }[key];
-
-                            let limit;
-                            if (!allowed) {
-                              limit = null;
-                            } else if (key === 'سناك') {
-                              limit = mealSub.snacksNumber ?? '∞';
-                            } else if (mealSub.bundleType === 'normal') {
-                              const perType = { 'افطار': mealSub.allowedBreakfast, 'غداء': mealSub.allowedLunch, 'عشاء': mealSub.allowedDinner }[key];
-                              limit = perType ?? mealSub.mealsNumber ?? '∞';
-                            } else {
-                              limit = mealSub.mealsNumber ?? '∞';
-                            }
-
-                            const blocked = limit === null;
-                            const over    = !blocked && limit !== '∞' && selected > limit;
-                            const full    = !blocked && limit !== '∞' && selected === limit && limit > 0;
+                            const blocked  = limit === null;
+                            const over     = !blocked && limit !== '∞' && selected > limit;
+                            const full     = !blocked && limit !== '∞' && selected === limit && limit > 0;
                             return (
                               <div key={key} style={{
                                 display:'flex', alignItems:'center', gap:'6px',
                                 padding:'6px 12px', borderRadius:'999px', fontSize:'0.8rem', fontWeight:700,
-                                background: blocked ? '#f8fafc' : over ? '#fff7ed' : full ? '#f0fdf4' : '#f0fdfa',
+                                background: blocked ? '#f1f5f9' : over ? '#fff7ed' : full ? '#f0fdf4' : '#f0fdfa',
                                 border:`1.5px solid ${blocked ? '#e2e8f0' : over ? '#fed7aa' : full ? '#bbf7d0' : '#ccfbf1'}`,
                                 color: blocked ? '#94a3b8' : over ? '#d97706' : full ? '#16a34a' : '#0d9488',
                               }}>
                                 <span>{icon} {label}</span>
                                 {blocked
-                                  ? <span style={{ fontSize:'0.7rem', marginRight:'2px' }}>غير مضمّن</span>
-                                  : <span style={{ marginRight:'2px' }}>{selected}/{limit} {over ? '⚠️' : full ? '✅' : ''}</span>
+                                  ? <span style={{ fontSize:'0.7rem' }}>غير مضمّن</span>
+                                  : <span>{selected}/{limit} {over ? '⚠️' : full ? '✅' : ''}</span>
                                 }
                               </div>
                             );
@@ -764,10 +884,7 @@ export default function ClientProfile() {
                             padding:'6px 12px', borderRadius:'999px', fontSize:'0.8rem', fontWeight:700,
                             background:'#f8fafc', border:'1.5px solid #e2e8f0', color:'#475569',
                           }}>
-                            🍽️ {mealSub.bundleType === 'flex'
-                              ? `${totalMealsWithoutSnacks}/${mealSub.mealsNumber ?? '∞'} وجبة + ${(clientMeals['سناك']||[]).length}/${mealSub.snacksNumber ?? '∞'} سناك`
-                              : `${totalSelected} / ${(mealSub.mealsNumber ?? 0) + (mealSub.snacksNumber ?? 0)} إجمالي`
-                            }
+                            🍽️ {totalSelected} / {mealSub.mealsNumber ?? '∞'} وجبة
                           </div>
                         </div>
                       </div>
@@ -963,6 +1080,64 @@ export default function ClientProfile() {
                 </div>
               )}
             </div>
+
+            {/* كود إعادة تعيين الباسورد */}
+            {!client.uid && (
+              <div style={{ margin:'0 20px 16px', padding:'14px 18px', background:'#fff1f2', border:'2px solid #fecdd3', borderRadius:'12px' }}>
+                <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+                  <div>
+                    <div style={{ fontWeight:800, color:'#dc2626', fontSize:'0.9rem' }}>⚠️ مفيش حساب دخول لهذا العميل</div>
+                    <div style={{ fontSize:'0.78rem', color:'#64748b', marginTop:4 }}>العميل مش هيقدر يسجل دخول للتطبيق</div>
+                  </div>
+                  <button className="btn btn-sm" style={{ background:'#dc2626', color:'white', border:'none', cursor:'pointer', fontFamily:'var(--font-main)', fontWeight:700, padding:'8px 16px', borderRadius:'8px' }}
+                    onClick={async () => {
+                      if (!client.phone) { alert('العميل مش عنده رقم هاتف'); return; }
+                      if (!window.confirm(`إنشاء حساب دخول للعميل ${client.name} برقم ${client.phone}؟`)) return;
+                      try {
+                        const res = await fetch('https://us-central1-diet-dashborad.cloudfunctions.net/createClientAuth', {
+                          method:'POST', headers:{'Content-Type':'application/json'},
+                          body: JSON.stringify({ clientId: client.id, phone: client.phone, name: client.name })
+                        });
+                        const data = await res.json();
+                        if (data.success) { alert('✅ تم إنشاء الحساب — كلمة المرور: ' + client.phone); load(); }
+                        else alert('❌ ' + (data.error || 'حصل خطأ'));
+                      } catch(e) { alert('❌ ' + e.message); }
+                    }}>
+                    + إنشاء حساب
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {client.pendingResetOTP && client.pendingResetOTP !== 'null' && (() => {
+              const isValid = true;
+              return (
+                <div style={{ margin:'0 20px 16px', padding:'14px 18px', background: isValid?'#fff7ed':'#f1f5f9', border:`2px solid ${isValid?'#f59e0b':'#cbd5e1'}`, borderRadius:'12px' }}>
+                  <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:'8px' }}>
+                    <span style={{ fontWeight:800, color: isValid?'#d97706':'#64748b', fontSize:'0.95rem' }}>
+                      🔑 كود إعادة تعيين الباسورد {!isValid && '(منتهي)'}
+                    </span>
+                    <div style={{ display:'flex', gap:'8px', alignItems:'center' }}>
+    
+                      <button className="btn btn-ghost btn-sm" onClick={load} title="تحديث">🔄</button>
+                    </div>
+                  </div>
+                  <div style={{ display:'flex', alignItems:'center', gap:'12px', flexWrap:'wrap' }}>
+                    <span style={{ fontFamily:'monospace', fontSize:'2.2rem', fontWeight:900, color: isValid?'#d97706':'#94a3b8', letterSpacing:'8px', background: isValid?'#fef3c7':'#f8fafc', padding:'8px 14px', borderRadius:'8px' }}>
+                      {client.pendingResetOTP}
+                    </span>
+                    {isValid && (
+                      <a href={`https://wa.me/96550771847?text=${encodeURIComponent(`مرحباً ${client.name}،\nكود إعادة تعيين كلمة المرور: *${client.pendingResetOTP}*\nادخل الكود في صفحة تسجيل الدخول واضغط "نسيت كلمة المرور" 🔑`)}`}
+                        target="_blank" rel="noreferrer"
+                        style={{ background:'#25D366', color:'white', borderRadius:'10px', padding:'10px 18px', textDecoration:'none', fontWeight:700, fontSize:'0.88rem', display:'flex', alignItems:'center', gap:'8px' }}>
+                        💬 إرسال على واتساب
+                      </a>
+                    )}
+                  </div>
+                </div>
+              );
+            })()}
+
             <div className="card-body">
               {!editingClient ? (
                 /* ── عرض البيانات ── */
@@ -1032,8 +1207,8 @@ export default function ClientProfile() {
                       <select className="form-control" value={clientForm.governorate}
                         onChange={e => setClientForm(p => ({...p, governorate: e.target.value, region: ''}))}>
                         <option value="">-- اختر --</option>
-                        {REGIONS_DATA.map(g => (
-                          <option key={g.key} value={g.nameAr}>{g.nameAr}</option>
+                        {govData.map(g => (
+                          <option key={g.id} value={g.nameAr}>{g.nameAr}</option>
                         ))}
                       </select>
                     </div>
@@ -1500,7 +1675,7 @@ export default function ClientProfile() {
 }
 
 // ── SubCard ──
-function SubCard({ sub, onCalendar }) {
+function SubCard({ sub, onCalendar, onExcel, onPDF }) {
   const status = getSubscriptionStatus(sub);
   const stl = getStatusLabel(status);
   const daysLeft = Math.max(0, Math.ceil((new Date(sub.endDate) - new Date()) / (1000*60*60*24)));
@@ -1516,11 +1691,20 @@ function SubCard({ sub, onCalendar }) {
           <div style={{ fontSize:'0.78rem', color:'#94a3b8', marginTop:'4px' }}>
             P{sub.protein} / C{sub.carbs} • {sub.mealsNumber} وجبة / {sub.snacksNumber} سناك
             {(sub.frozenDays||[]).length > 0 && <span style={{ color:'#d97706', marginRight:'8px' }}>❄ {sub.frozenDays.length} مجمد</span>}
+            {sub.bonusDays > 0 && <span style={{ color:'#16a34a', marginRight:'8px' }}>🎁 {sub.bonusDays} يوم تعويض</span>}
           </div>
+          {sub.couponCode && (
+            <div style={{ fontSize:'0.75rem', color:'#0d9488', marginTop:'4px' }}>
+              🎟 {sub.couponCode} — خصم {Number(sub.discountAmount||0).toFixed(3)} KWD
+              {' '}(الأصلي: {Number(sub.originalPrice||0).toFixed(3)} → النهائي: {Number(sub.finalPrice||0).toFixed(3)} KWD)
+            </div>
+          )}
         </div>
-        <div style={{ display:'flex', gap:'8px', alignItems:'center' }}>
+        <div style={{ display:'flex', gap:'6px', alignItems:'center', flexWrap:'wrap', justifyContent:'flex-end' }}>
           <span style={{ fontSize:'0.78rem', fontWeight:700, color:stl.color, background:stl.bg, padding:'4px 12px', borderRadius:'999px' }}>{stl.label}</span>
           {onCalendar && <button className="btn btn-outline btn-sm" onClick={onCalendar}>التقويم</button>}
+          {onExcel && <button className="btn btn-ghost btn-sm" onClick={() => onExcel(sub)} title="تنزيل Excel">📊 Excel</button>}
+          {onPDF   && <button className="btn btn-ghost btn-sm" onClick={() => onPDF(sub)}   title="طباعة PDF">🖨️ PDF</button>}
         </div>
       </div>
     </div>
@@ -1534,14 +1718,26 @@ function SubForm({ form, setForm, packages, calcEndDate }) {
     <div>
       <div className="section-title">نوع الباقة</div>
       <div className="radio-group" style={{ marginBottom:'16px' }}>
-        <div className="radio-option">
-          <input type="radio" id="f-normal" name="sbt" checked={form.bundleType==='normal'} onChange={() => update('bundleType','normal')} />
-          <label htmlFor="f-normal">باقة ثابتة</label>
-        </div>
-        <div className="radio-option">
-          <input type="radio" id="f-flex" name="sbt" checked={form.bundleType==='flex'} onChange={() => update('bundleType','flex')} />
-          <label htmlFor="f-flex">باقة مرنة</label>
-        </div>
+        {[
+          { value:'normal', label:'📦 باقة ثابتة' },
+          { value:'flex',   label:'✨ باقة مرنة'  },
+        ].map(opt => {
+          const active = form.bundleType === opt.value
+            || (opt.value === 'flex' && (form.bundleType === 'custom' || form.bundleType === 'flex'));
+          return (
+            <div key={opt.value} className="radio-option" onClick={() => update('bundleType', opt.value)}
+              style={{ cursor:'pointer' }}>
+              <label style={{
+                cursor:'pointer', display:'flex', alignItems:'center', justifyContent:'center',
+                padding:'10px 16px', fontWeight: active ? 700 : 500,
+                background: active ? 'var(--teal,#0d9488)' : 'transparent',
+                color: active ? 'white' : 'inherit', height:'100%', width:'100%',
+              }}>
+                {opt.label}
+              </label>
+            </div>
+          );
+        })}
       </div>
       {form.bundleType === 'normal' ? (
         <div className="form-group" style={{ marginBottom:'16px' }}>
@@ -1588,14 +1784,38 @@ function SubForm({ form, setForm, packages, calcEndDate }) {
         <div className="form-group">
           <label className="form-label">تاريخ البدء</label>
           <input className="form-control" type="date" value={form.startDate}
-            onChange={e => { update('startDate', e.target.value); update('endDate', calcEndDate(e.target.value, form.durationWeeks)); }} />
+            onChange={e => { update('startDate', e.target.value); update('endDate', calcEndDate(e.target.value, form.durationWeeks, form.durationDays)); }} />
         </div>
         <div className="form-group">
           <label className="form-label">المدة</label>
-          <select className="form-control" value={form.durationWeeks}
-            onChange={e => { const w=parseInt(e.target.value); update('durationWeeks',w); update('endDate',calcEndDate(form.startDate,w)); }}>
-            {[1,2,3,4,6,8,12].map(w => <option key={w} value={w}>{w} {w===1?'أسبوع':'أسابيع'}</option>)}
+          <select className="form-control"
+            value={form.durationDays != null ? `days_${form.durationDays}` : `weeks_${form.durationWeeks || 4}`}
+            onChange={e => {
+              const val = e.target.value;
+              const opt = DURATION_OPTIONS.find(o => (o.days && `days_${o.days}` === val) || (!o.days && `weeks_${o.weeks}` === val));
+              if (val === 'days_0') { update('durationWeeks', 0); update('durationDays', null); update('endDate', ''); return; }
+              if (val.startsWith('days_')) {
+                const d = parseInt(val.split('_')[1]);
+                update('durationDays', d); update('durationWeeks', null);
+                update('endDate', calcEndDate(form.startDate, null, d));
+              } else {
+                const w = parseInt(val.split('_')[1]);
+                update('durationWeeks', w); update('durationDays', null);
+                update('endDate', calcEndDate(form.startDate, w, null));
+              }
+            }}>
+            {DURATION_OPTIONS.map(opt => (
+              <option key={opt.label} value={opt.days && opt.label !== 'مخصص' ? `days_${opt.days}` : `weeks_${opt.weeks}`}>
+                {opt.label}
+              </option>
+            ))}
           </select>
+          {(form.durationDays == null && form.durationWeeks == null) && (
+            <div style={{ display:'flex', gap:6, marginTop:6 }}>
+              <input className="form-control" type="number" placeholder="الأيام" style={{ flex:1 }}
+                onChange={e => { const d=Number(e.target.value); update('durationDays',d); update('endDate',calcEndDate(form.startDate,null,d)); }} />
+            </div>
+          )}
         </div>
         {form.endDate && (
           <div className="form-group" style={{ gridColumn:'1/-1' }}>

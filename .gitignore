@@ -67,3 +67,42 @@ node_modules/
 
 # dataconnect generated files
 .dataconnect
+
+# AI tool directories (added 2026-05-04)
+.adal/
+.agents/
+.augment/
+.bob/
+.claude/
+.codebuddy/
+.commandcode/
+.continue/
+.cortex/
+.crush/
+.factory/
+.goose/
+.iflow/
+.junie/
+.kilocode/
+.kiro/
+.kode/
+.mcpjam/
+.mux/
+.neovate/
+.openhands/
+.pi/
+.pochi/
+.qoder/
+.qwen/
+.roo/
+.trae/
+.vibe/
+.windsurf/
+.zencoder/
+skills/
+skills-lock.json
+.vite/
+
+# OS files
+Thumbs.db
+.DS_Store

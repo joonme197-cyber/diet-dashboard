@@ -8,6 +8,7 @@
   --sidebar-bg: #0f172a;
   --sidebar-text: #94a3b8;
   --sidebar-active: #14b8a6;
+  --sidebar-width: 260px;
   --card: #ffffff;
   --border: #e2e8f0;
   --text: #1e293b;
@@ -37,8 +38,9 @@ body {
   min-height: 100vh;
 }
 
+/* ===== SIDEBAR ===== */
 .sidebar {
-  width: 260px;
+  width: var(--sidebar-width);
   background: var(--sidebar-bg);
   display: flex;
   flex-direction: column;
@@ -111,9 +113,74 @@ body {
   text-align: center;
 }
 
+/* زر الهامبرغر — مخفي على الديسكتوب */
+.mobile-menu-btn {
+  display: none;
+  position: fixed;
+  top: 14px;
+  right: 14px;
+  z-index: 200;
+  width: 44px;
+  height: 44px;
+  border-radius: 10px;
+  border: none;
+  background: var(--sidebar-bg);
+  cursor: pointer;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.15);
+}
+
+.hamburger-line {
+  display: block;
+  width: 22px;
+  height: 2.5px;
+  background: var(--teal-light);
+  border-radius: 2px;
+  transition: all 0.3s;
+}
+
+/* زر إغلاق السايدبار — مخفي على الديسكتوب */
+.sidebar-close-btn {
+  display: none;
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  border: 1px solid #334155;
+  background: #1e293b;
+  color: #94a3b8;
+  font-size: 1rem;
+  cursor: pointer;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+  transition: all 0.2s;
+}
+
+.sidebar-close-btn:hover {
+  background: #ef4444;
+  color: white;
+  border-color: #ef4444;
+}
+
+/* الأوفرلاي */
+.sidebar-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.5);
+  z-index: 99;
+  backdrop-filter: blur(2px);
+}
+
 .main-content {
   flex: 1;
-  margin-right: 260px;
+  margin-right: var(--sidebar-width);
   min-height: 100vh;
   display: flex;
   flex-direction: column;
@@ -129,6 +196,8 @@ body {
   position: sticky;
   top: 0;
   z-index: 50;
+  flex-wrap: wrap;
+  gap: 10px;
 }
 
 .page-header h2 {
@@ -160,6 +229,8 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
 }
 
 .card-header h3 {
@@ -221,6 +292,7 @@ body {
   transition: border-color 0.2s, box-shadow 0.2s;
   outline: none;
   direction: rtl;
+  width: 100%;
 }
 
 .form-control:focus {
@@ -432,11 +504,13 @@ textarea.form-control {
 
 .table-wrapper {
   overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 table {
   width: 100%;
   border-collapse: collapse;
+  min-width: 600px;
 }
 
 th {
@@ -449,6 +523,7 @@ th {
   text-transform: uppercase;
   letter-spacing: 0.5px;
   border-bottom: 1px solid var(--border);
+  white-space: nowrap;
 }
 
 td {
@@ -473,6 +548,7 @@ tr:last-child td {
   border-radius: 999px;
   font-size: 0.75rem;
   font-weight: 600;
+  white-space: nowrap;
 }
 
 .badge-green {
@@ -515,6 +591,7 @@ tr:last-child td {
   align-items: center;
   justify-content: center;
   font-size: 1.4rem;
+  flex-shrink: 0;
 }
 
 .stat-icon.teal { background: var(--teal-100); }
@@ -561,6 +638,9 @@ tr:last-child td {
   .no-print { display: none !important; }
   .print-only { display: block !important; }
   body { background: white; }
+  .sidebar { display: none !important; }
+  .mobile-menu-btn { display: none !important; }
+  .main-content { margin-right: 0 !important; }
 }
 
 /* ===== STICKER - 10cm x 8cm ===== */
@@ -817,17 +897,6 @@ tr:last-child td {
   color: var(--text);
 }
 
-@media (max-width: 1024px) {
-  .stats-grid { grid-template-columns: repeat(2, 1fr); }
-}
-
-@media (max-width: 768px) {
-  .sidebar { transform: translateX(100%); }
-  .main-content { margin-right: 0; }
-  .form-grid { grid-template-columns: 1fr; }
-  .form-grid.col-4 { grid-template-columns: repeat(2, 1fr); }
-}
-
 @keyframes fadeIn {
   from { opacity: 0; transform: translateY(8px); }
   to { opacity: 1; transform: translateY(0); }
@@ -871,4 +940,218 @@ tr:last-child td {
   outline: none;
   color: var(--text);
   height: 40px;
+}
+
+/* ================================================================
+   RESPONSIVE — تابلت (768px - 1024px)
+   ================================================================ */
+@media (max-width: 1024px) {
+  .stats-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .form-grid.col-4 {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .stat-info h3 {
+    font-size: 1.3rem;
+  }
+}
+
+/* ================================================================
+   RESPONSIVE — موبايل وتابلت صغير (أقل من 768px)
+   ================================================================ */
+@media (max-width: 768px) {
+  /* السايدبار يختفي ويطلع كـ drawer */
+  .sidebar {
+    transform: translateX(100%);
+    width: 280px;
+    box-shadow: -4px 0 24px rgba(0,0,0,0.3);
+  }
+
+  .sidebar.sidebar-open {
+    transform: translateX(0);
+  }
+
+  /* إظهار زر الهامبرغر */
+  .mobile-menu-btn {
+    display: flex;
+  }
+
+  /* إظهار زر الإغلاق داخل السايدبار */
+  .sidebar-close-btn {
+    display: flex;
+  }
+
+  /* إظهار الأوفرلاي */
+  .sidebar-overlay {
+    display: block;
+  }
+
+  /* المحتوى الرئيسي يأخذ كامل العرض */
+  .main-content {
+    margin-right: 0;
+  }
+
+  /* الهيدر */
+  .page-header {
+    padding: 14px 16px;
+    padding-top: 60px; /* مساحة لزر الهامبرغر */
+  }
+
+  .page-header h2 {
+    font-size: 1.05rem;
+  }
+
+  /* محتوى الصفحة */
+  .page-body {
+    padding: 16px 12px;
+  }
+
+  /* الفورم */
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .form-grid.col-4 {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  /* الإحصائيات */
+  .stats-grid {
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+
+  .stat-card {
+    padding: 14px;
+    gap: 10px;
+  }
+
+  .stat-icon {
+    width: 40px;
+    height: 40px;
+    font-size: 1.1rem;
+  }
+
+  .stat-info h3 {
+    font-size: 1.2rem;
+  }
+
+  .stat-info p {
+    font-size: 0.72rem;
+  }
+
+  /* الكروت */
+  .card-header {
+    padding: 14px 16px;
+  }
+
+  .card-body {
+    padding: 16px;
+  }
+
+  /* الجداول */
+  .table-wrapper {
+    margin: 0 -12px;
+    padding: 0 12px;
+  }
+
+  th, td {
+    padding: 10px 12px;
+    font-size: 0.8rem;
+  }
+
+  /* المودال */
+  .modal-overlay {
+    padding: 12px;
+    align-items: flex-end;
+  }
+
+  .modal {
+    border-radius: 16px 16px 0 0;
+    max-height: 85vh;
+  }
+
+  .modal-header {
+    padding: 16px 18px;
+  }
+
+  .modal-body {
+    padding: 18px;
+  }
+
+  /* الأزرار */
+  .btn {
+    padding: 10px 16px;
+    font-size: 0.85rem;
+  }
+
+  .btn-full {
+    padding: 12px 20px;
+  }
+}
+
+/* ================================================================
+   RESPONSIVE — موبايل صغير (أقل من 480px)
+   ================================================================ */
+@media (max-width: 480px) {
+  .stats-grid {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+
+  .stat-card {
+    padding: 12px;
+  }
+
+  .form-grid.col-4 {
+    grid-template-columns: 1fr;
+  }
+
+  .page-header h2 {
+    font-size: 0.95rem;
+  }
+
+  .page-body {
+    padding: 12px 10px;
+  }
+
+  .radio-group {
+    flex-direction: column;
+  }
+
+  .radio-option label {
+    border-left: none;
+    border-bottom: 1px solid var(--border);
+    padding: 12px 16px;
+  }
+
+  .radio-option:last-child label {
+    border-bottom: none;
+  }
+
+  .modal-overlay {
+    padding: 0;
+  }
+
+  .modal {
+    border-radius: 16px 16px 0 0;
+    max-height: 90vh;
+  }
+
+  .checkbox-row {
+    gap: 12px;
+  }
+
+  .days-grid {
+    gap: 6px;
+  }
+
+  .day-chip label {
+    width: 38px;
+    height: 38px;
+    font-size: 0.72rem;
+  }
 }

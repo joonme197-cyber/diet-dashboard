@@ -1,6 +1,6 @@
 import { forwardRef } from 'react';
-import { useLang, REGIONS_DATA } from '../LanguageContext';
-import { MEALS_DATA } from '../firebase/mealService';
+import { useLang } from '../LanguageContext';
+import { useGovernorates } from '../hooks/useGovernorates';
 
 // ─────────────────────────────────────────────────────────────
 // StickerLabel — طابعة حرارية 10×8 سم
@@ -11,8 +11,9 @@ import { MEALS_DATA } from '../firebase/mealService';
 //   dailyMeals   — { افطار:[], غداء:[], عشاء:[], سناك:[] }
 //   qIndex       — ترتيب الليبول (1, 2, 3, ...) يتحدد من الصفحة الأب
 // ─────────────────────────────────────────────────────────────
-const StickerLabel = forwardRef(({ client, activeSub, deliveryDate, dailyMeals, qIndex = 1 }, ref) => {
+const StickerLabel = forwardRef(({ client, activeSub, deliveryDate, dailyMeals, qIndex = 1, allMeals = [] }, ref) => {
   const { lang } = useLang();
+  const { governorates } = useGovernorates();
   const isAr = lang === 'ar';
 
   const today = deliveryDate ? new Date(deliveryDate) : new Date();
@@ -24,9 +25,11 @@ const StickerLabel = forwardRef(({ client, activeSub, deliveryDate, dailyMeals, 
     : (() => { const d = new Date(startDate); d.setDate(d.getDate() + (sub?.durationWeeks || 4) * 7); return d; })();
   const daysLeft  = Math.max(0, Math.ceil((endDate - today) / (1000 * 60 * 60 * 24)));
 
-  // ── البروتين والكارب من الاشتراك ──
-  const protein = sub?.protein ? String(sub.protein).replace('g', '') : '---';
-  const carbs   = sub?.carbs   ? String(sub.carbs).replace('g', '')   : '---';
+  // ── البروتين والكارب من الاشتراك أو الـ flexConfig داخله ──
+  const rawProtein = sub?.protein || sub?.flexConfig?.protein || sub?.packageSnapshot?.protein || 0;
+  const rawCarbs   = sub?.carbs   || sub?.flexConfig?.carbs   || sub?.packageSnapshot?.carbs   || sub?.packageSnapshot?.carbohydrates || 0;
+  const protein = rawProtein ? String(rawProtein).replace('g', '') : '---';
+  const carbs   = rawCarbs   ? String(rawCarbs).replace('g', '')   : '---';
 
   // ── اسم الباقة من الاشتراك ──
   const packageName = isAr
@@ -43,10 +46,8 @@ const StickerLabel = forwardRef(({ client, activeSub, deliveryDate, dailyMeals, 
   // ── اسم الوجبة — يبحث في MEALS_DATA للحصول على الاسم الإنجليزي ──
   const mealName = (item) => {
     if (!item) return '';
-    // ابحث في MEALS_DATA باستخدام id
-    const master = item.id ? MEALS_DATA.find(m => m.id === item.id) : null;
+    const master = item.id && allMeals.length > 0 ? allMeals.find(m => m.id === item.id) : null;
     if (master) return isAr ? master.mealTitle : (master.mealTitleEn || master.mealTitle);
-    // fallback لو مفيش id
     if (typeof item === 'string') return item;
     if (item.title) return item.title;
     return isAr ? (item.ar || item.en || '') : (item.en || item.ar || '');
@@ -55,9 +56,9 @@ const StickerLabel = forwardRef(({ client, activeSub, deliveryDate, dailyMeals, 
   const formatDate = (d) =>
     `${d.getDate().toString().padStart(2,'0')}/${(d.getMonth()+1).toString().padStart(2,'0')}/${d.getFullYear()}`;
 
-  // ── ترجمة المحافظة والمنطقة من REGIONS_DATA ──
-  const govData    = REGIONS_DATA.find(g => g.nameAr === client.governorate || g.nameEn === client.governorate);
-  const regionData = govData?.regions?.find(r => r.nameAr === client.region || r.nameEn === client.region);
+  // ── ترجمة المحافظة والمنطقة من Firestore ──
+  const govObj    = governorates.find(g => g.nameAr === client.governorate || g.nameEn === client.governorate);
+  const regionObj = govObj?.regions?.find(r => r.ar === client.region || r.en === client.region || r.nameAr === client.region || r.nameEn === client.region);
 
   const L = {
     breakfast: isAr ? 'الفطور'          : 'Breakfast',
@@ -72,12 +73,12 @@ const StickerLabel = forwardRef(({ client, activeSub, deliveryDate, dailyMeals, 
     area:      isAr ? 'م'               : 'A',
     meals:     isAr ? 'وجبات'           : 'Meals',
     snacksLbl: isAr ? 'سناك'            : 'Snacks',
-    govVal:    isAr ? (govData?.nameAr    || client.governorate || '—') : (govData?.nameEn    || client.governorate || '—'),
-    regionVal: isAr ? (regionData?.nameAr || client.region      || '—') : (regionData?.nameEn || client.region      || '—'),
+    govVal:    isAr ? (govObj?.nameAr  || client.governorate || '—') : (govObj?.nameEn  || client.governorate || '—'),
+    regionVal: isAr ? (regionObj?.ar || regionObj?.nameAr || client.region || '—') : (regionObj?.en || regionObj?.nameEn || client.region || '—'),
   };
 
-  const mealsCount  = sub?.mealsNumber  || client.mealsNumber  || 0;
-  const snacksCount = sub?.snacksNumber || client.snacksNumber || 0;
+  const mealsCount  = sub?.mealsNumber  || sub?.flexConfig?.mealsNumber  || client.mealsNumber  || 0;
+  const snacksCount = sub?.snacksNumber || sub?.flexConfig?.snacksNumber || client.snacksNumber || 0;
 
   return (
     <>

@@ -4,14 +4,84 @@ import { getClients, addClient, updateClient } from '../firebase/clientService';
 import { addSubscription } from '../firebase/subscriptionService';
 import { getPackages } from '../firebase/packageService';
 import { useLang } from '../LanguageContext';
-import { REGIONS_DATA } from '../LanguageContext';
-import { getPricingSettings, calcCustomPrice } from '../firebase/pricingService';
+import { REGIONS_DATA } from '../LanguageContext'; // fallback
+import { useGovernorates } from '../hooks/useGovernorates';
+import { getPricingSettings, calcCustomPrice, getFlexSettings, DEFAULT_FLEX_SETTINGS } from '../firebase/pricingService';
+import { validateCoupon, calcDiscount, recordCouponUsage } from '../firebase/couponService';
+import { db } from '../firebase/config';
+import { getDoc, doc } from 'firebase/firestore';
 
 const PAYMENT_METHODS = ['كاش / Cash', 'Knet', 'Visa/Mastercard', 'WhatsApp Link', 'آجل / Credit'];
-const PROTEIN_OPTIONS = [100, 120, 150, 180, 200];
-const CARBS_OPTIONS   = [50, 100, 150, 200];
+const PROTEIN_OPTIONS = [80, 90, 100, 120, 150, 180, 200];
+const CARBS_OPTIONS   = [50, 80, 100, 120, 150, 200];
 const DAYS_AR = ['السبت','الأحد','الاثنين','الثلاثاء','الأربعاء','الخميس','الجمعة'];
 const DAYS_EN = ['Sat','Sun','Mon','Tue','Wed','Thu','Fri'];
+const DURATION_LABELS = {
+  7:'1 أسبوع', 14:'2 أسبوع', 21:'3 أسابيع', 20:'20 يوم',
+  26:'26 يوم', 28:'1 شهر', 35:'5 أسابيع', 42:'6 أسابيع', 56:'2 شهر', 84:'3 شهور',
+};
+// مكونات مساعدة للباقة المرنة
+function FChip({ label, active, color, onClick }) {
+  return (
+    <button type="button" onClick={onClick} style={{
+      padding:'6px 14px', borderRadius:999, fontFamily:'var(--font-main)',
+      fontWeight:700, fontSize:'0.83rem', cursor:'pointer', transition:'all 0.15s',
+      border:`2px solid ${active ? color : '#e2e8f0'}`,
+      background: active ? color : 'white',
+      color: active ? 'white' : '#374151',
+      boxShadow: active ? `0 2px 8px ${color}40` : 'none',
+    }}>{label}</button>
+  );
+}
+function FSection({ icon, title, children }) {
+  return (
+    <div style={{ marginBottom:14, padding:'12px 14px', borderRadius:10,
+      border:'1.5px solid #e2e8f0', background:'#fafafa' }}>
+      <div style={{ fontWeight:700, fontSize:'0.83rem', marginBottom:10, color:'#374151',
+        display:'flex', alignItems:'center', gap:6 }}>
+        <span>{icon}</span>{title}
+      </div>
+      {children}
+    </div>
+  );
+}
+function FMealRow({ icon, label, enabled, count, max, onToggle, onCount }) {
+  return (
+    <div style={{
+      display:'flex', alignItems:'center', gap:10, padding:'8px 12px',
+      borderRadius:8, marginBottom:6, transition:'all 0.2s',
+      border:`1.5px solid ${enabled?'#0d9488':'#e2e8f0'}`,
+      background: enabled?'#f0fdfa':'white',
+    }}>
+      <div onClick={onToggle} style={{
+        width:38, height:21, borderRadius:999, position:'relative', cursor:'pointer', flexShrink:0,
+        background:enabled?'#0d9488':'#cbd5e1', transition:'background 0.2s',
+      }}>
+        <div style={{ position:'absolute', top:2, width:17, height:17, borderRadius:'50%',
+          background:'white', transition:'left 0.2s', left:enabled?19:2,
+          boxShadow:'0 1px 3px rgba(0,0,0,0.2)' }}/>
+      </div>
+      <span style={{ fontSize:'1rem' }}>{icon}</span>
+      <span style={{ fontWeight:700, flex:1, fontSize:'0.85rem',
+        color:enabled?'#0f172a':'#94a3b8' }}>{label}</span>
+      {enabled && (
+        <div style={{ display:'flex', alignItems:'center', gap:6 }}>
+          <button type="button" onClick={()=>count>1&&onCount(count-1)}
+            style={{ width:26,height:26,borderRadius:'50%',border:'1.5px solid #e2e8f0',
+              background:'white',cursor:count>1?'pointer':'default',fontWeight:900,fontSize:'0.9rem',
+              display:'flex',alignItems:'center',justifyContent:'center',
+              color:count>1?'#0d9488':'#94a3b8' }}>−</button>
+          <span style={{ fontWeight:900, minWidth:18, textAlign:'center' }}>{count}</span>
+          <button type="button" onClick={()=>count<max&&onCount(count+1)}
+            style={{ width:26,height:26,borderRadius:'50%',border:'1.5px solid #e2e8f0',
+              background:'white',cursor:count<max?'pointer':'default',fontWeight:900,fontSize:'0.9rem',
+              display:'flex',alignItems:'center',justifyContent:'center',
+              color:count<max?'#0d9488':'#94a3b8' }}>+</button>
+        </div>
+      )}
+    </div>
+  );
+}
 const MEAL_TYPES_CONFIG = [
   { key: 'breakfast', ar: 'الفطور', en: 'Breakfast', icon: '🍳', allowKey: 'allowBreakfast', maxKey: 'allowedBreakfast' },
   { key: 'lunch',     ar: 'الغداء', en: 'Lunch',     icon: '🍛', allowKey: 'allowLunch',     maxKey: 'allowedLunch'     },
@@ -21,6 +91,7 @@ const MEAL_TYPES_CONFIG = [
 
 export default function NewSubscription() {
   const { lang, t, isAr } = useLang();
+  const { governorates: govData } = useGovernorates();
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
 
@@ -33,6 +104,7 @@ export default function NewSubscription() {
   const [step, setStep]                     = useState(1);
   const [msg, setMsg]                       = useState('');
   const [pricing, setPricing]               = useState(null);
+  const [flexSettings, setFlexSettings]     = useState(DEFAULT_FLEX_SETTINGS);
 
   const [newClientForm, setNewClientForm] = useState({
     name: searchParams.get('clientName') || '',
@@ -55,9 +127,43 @@ export default function NewSubscription() {
     paymentMethod: 'كاش / Cash', paymentAmount: '', notes: '',
   });
 
+  // ── كوبون الخصم ──
+  const [couponCode, setCouponCode]   = useState('');
+  const [couponData, setCouponData]   = useState(null);
+  const [couponError, setCouponError] = useState('');
+  const [couponLoading, setCouponLoading] = useState(false);
+
+  const applyCoupon = async () => {
+    if (!couponCode) return;
+    setCouponLoading(true); setCouponError(''); setCouponData(null);
+    const result = await validateCoupon(couponCode, {
+      packageId: subForm.packageId,
+      durationWeeks: subForm.durationWeeks,
+      bundleType: subForm.bundleType,
+    });
+    if (result.valid) {
+      setCouponData(result.coupon);
+    } else {
+      setCouponError(result.error);
+    }
+    setCouponLoading(false);
+  };
+
+  const removeCoupon = () => { setCouponData(null); setCouponCode(''); setCouponError(''); };
+
   useEffect(() => {
-    Promise.all([getClients(), getPackages(), getPricingSettings()]).then(([c, p, pr]) => {
+    Promise.all([
+      getClients(), getPackages(), getPricingSettings(), getFlexSettings(),
+      getDoc(doc(db, 'appConfig', 'autoSelectSettings')).catch(()=>null)
+    ]).then(([c, p, pr, fs, settingsSnap]) => {
       setClients(c); setPackages(p); setPricing(pr);
+      if (fs) setFlexSettings(fs);
+
+      // حساب تاريخ البداية بناءً على subscriptionLeadHours
+      const leadHours = settingsSnap?.exists?.() ? (settingsSnap.data().subscriptionLeadHours || 72) : 72;
+      const defaultStart = new Date(Date.now() + leadHours * 60 * 60 * 1000).toISOString().split('T')[0];
+      setSubForm(prev => ({ ...prev, startDate: defaultStart }));
+
       const cId = searchParams.get('clientId');
       if (cId) {
         const found = c.find(x => x.id === cId);
@@ -108,9 +214,11 @@ export default function NewSubscription() {
     return calcCustomPrice(subForm, pricing, getTotalDays());
   };
 
-  const govOptions    = REGIONS_DATA.map(g => ({ key: g.key, label: isAr ? g.nameAr : g.nameEn, nameAr: g.nameAr, nameEn: g.nameEn }));
-  const selectedGov   = REGIONS_DATA.find(g => g.key === newClientForm.governorate);
-  const regionOptions = selectedGov ? selectedGov.regions.map(r => ({ label: isAr ? r.nameAr : r.nameEn, nameAr: r.nameAr, nameEn: r.nameEn })) : [];
+  const govOptions    = govData.map(g => ({ key: g.id, label: isAr ? g.nameAr : g.nameEn, nameAr: g.nameAr, nameEn: g.nameEn }));
+  const selectedGovObj = govData.find(g => g.nameAr === newClientForm.governorate || g.nameEn === newClientForm.governorate || g.id === newClientForm.governorate);
+  const regionOptions = selectedGovObj
+    ? (selectedGovObj.regions || []).filter(r => r.active !== false).map(r => ({ label: isAr ? r.nameAr : r.nameEn, nameAr: r.nameAr, nameEn: r.nameEn }))
+    : [];
 
   const handleSaveClient = async () => {
     if (!newClientForm.name || !newClientForm.phone) { alert(isAr ? 'الاسم والهاتف مطلوبان' : 'Name and phone required'); return; }
@@ -145,7 +253,12 @@ export default function NewSubscription() {
       const pkg     = packages.find(p => p.id === subForm.packageId);
       const endDate = calcEndDate(subForm.startDate, subForm.durationWeeks, subForm.durationDays);
 
-      await addSubscription({
+      // حساب الخصم
+      const originalPrice  = Number(subForm.paymentAmount) || 0;
+      const discountAmount = couponData ? calcDiscount(couponData, originalPrice) : 0;
+      const finalPrice     = originalPrice - discountAmount;
+
+      const subRef = await addSubscription({
         clientId: selectedClient.id, clientName: selectedClient.name,
         clientCode: selectedClient.clientCode,
         packageId:   subForm.packageId,
@@ -160,13 +273,38 @@ export default function NewSubscription() {
         allowDinner:    subForm.allowDinner,    allowedDinner:    subForm.allowedDinner,
         allowSnacks:    subForm.allowSnacks,
         deliveryDays:   subForm.deliveryDays,
+        fridays:        subForm.fridays === true,
         payments: subForm.paymentMethod !== 'آجل / Credit' && subForm.paymentAmount ? [{
-          method: subForm.paymentMethod, amount: subForm.paymentAmount,
+          method: subForm.paymentMethod, amount: finalPrice,
           date: new Date().toISOString().split('T')[0],
         }] : [],
         paymentStatus: subForm.paymentMethod === 'آجل / Credit' ? 'pending' : 'paid',
         notes: subForm.notes, status: 'active',
+        // بيانات الكوبون
+        ...(couponData ? {
+          couponCode:     couponData.code,
+          couponId:       couponData.id,
+          originalPrice,
+          discountAmount,
+          finalPrice,
+        } : {}),
       });
+
+      // تسجيل استخدام الكوبون
+      if (couponData) {
+        await recordCouponUsage(couponData.id, {
+          subscriptionId: subRef.id,
+          clientId:    selectedClient.id,
+          clientName:  selectedClient.name,
+          clientCode:  selectedClient.clientCode,
+          packageName: isAr ? (pkg?.nameAr || 'باقة مخصصة') : (pkg?.nameEn || 'Custom Bundle'),
+          couponCode:  couponData.code,
+          originalPrice,
+          discountAmount,
+          finalPrice,
+          startDate: subForm.startDate,
+        });
+      }
 
       setMsg(isAr ? '✅ تم إنشاء الاشتراك بنجاح!' : '✅ Subscription created successfully!');
       setTimeout(() => navigate(`/clients/${selectedClient.id}`), 1500);
@@ -304,9 +442,14 @@ export default function NewSubscription() {
                 <div className="form-group">
                   <label className="form-label">{isAr ? 'المحافظة' : 'Governorate'}</label>
                   <select className="form-control" value={newClientForm.governorate}
-                    onChange={e => { const gov = REGIONS_DATA.find(g => g.key === e.target.value); updateNew('governorate', e.target.value); updateNew('governorateEn', gov?.nameEn || ''); updateNew('region', ''); updateNew('regionEn', ''); }}>
+                    onChange={e => {
+                      const gov = govData.find(g => g.nameAr === e.target.value || g.nameEn === e.target.value || g.id === e.target.value);
+                      updateNew('governorate', isAr ? (gov?.nameAr || e.target.value) : (gov?.nameEn || e.target.value));
+                      updateNew('governorateEn', gov?.nameEn || '');
+                      updateNew('region', ''); updateNew('regionEn', '');
+                    }}>
                     <option value="">--</option>
-                    {govOptions.map(g => <option key={g.key} value={g.key}>{g.label}</option>)}
+                    {govOptions.map(g => <option key={g.key} value={isAr ? g.nameAr : g.nameEn}>{g.label}</option>)}
                   </select>
                 </div>
                 <div className="form-group">
@@ -396,6 +539,7 @@ export default function NewSubscription() {
                             updateSub('allowedBreakfast', pkg.allowedBreakfast || 1);
                             updateSub('allowedLunch',     pkg.allowedLunch     || 1);
                             updateSub('allowedDinner',    pkg.allowedDinner    || 1);
+                            updateSub('fridays',          pkg.fridays === true);
                             const fp = pkg.prices?.[0];
                             if (fp) updateSub('paymentAmount', fp.price || '');
                           }
@@ -426,97 +570,139 @@ export default function NewSubscription() {
                 )}
 
                 {/* باقة مرنة */}
-                {subForm.bundleType === 'custom' && (
+                {subForm.bundleType === 'custom' && (() => {
+                  const totalMeals =
+                    (subForm.allowBreakfast !== false ? subForm.allowedBreakfast || 1 : 0) +
+                    (subForm.allowLunch     !== false ? subForm.allowedLunch     || 1 : 0) +
+                    (subForm.allowDinner    !== false ? subForm.allowedDinner    || 1 : 0);
+                  const minDays = flexSettings.minDaysPerWeek || 5;
+                  const maxDays = flexSettings.maxDaysPerWeek || 6;
+                  const daysCount = (subForm.deliveryDays || []).length;
+                  const mealsOk = totalMeals >= (flexSettings.minMealsPerDay||2) && totalMeals <= (flexSettings.maxMealsPerDay||5);
+                  const daysOk  = daysCount >= minDays && daysCount <= maxDays;
+                  return (
                   <div className="fade-in" style={{ marginBottom: '16px' }}>
-                    {/* الجرامات */}
-                    <div className="form-grid" style={{ marginBottom: '16px' }}>
-                      <div className="form-group">
-                        <label className="form-label">{isAr ? 'البروتين' : 'Protein'}</label>
-                        <select className="form-control" value={subForm.protein} onChange={e => updateSub('protein', e.target.value)}>
-                          {PROTEIN_OPTIONS.map(p => <option key={p} value={p}>{p}g</option>)}
-                        </select>
-                      </div>
-                      <div className="form-group">
-                        <label className="form-label">{isAr ? 'الكارب' : 'Carbs'}</label>
-                        <select className="form-control" value={subForm.carbs} onChange={e => updateSub('carbs', e.target.value)}>
-                          {CARBS_OPTIONS.map(c => <option key={c} value={c}>{c}g</option>)}
-                        </select>
-                      </div>
-                    </div>
 
-                    {/* أنواع الوجبات */}
-                    <div className="section-title" style={{ marginBottom: '10px' }}>{isAr ? 'أنواع الوجبات المسموحة' : 'Allowed Meal Types'}</div>
-                    <div style={{ marginBottom: '16px' }}>
-                      {MEAL_TYPES_CONFIG.map(mt => (
-                        <div key={mt.key} style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '10px 14px', borderRadius: '8px', marginBottom: '6px', background: subForm[mt.allowKey] !== false ? '#f0fdfa' : '#f8fafc', border: `1px solid ${subForm[mt.allowKey] !== false ? '#ccfbf1' : '#e2e8f0'}` }}>
-                          <input type="checkbox" checked={subForm[mt.allowKey] !== false} onChange={e => updateSub(mt.allowKey, e.target.checked)} style={{ accentColor: '#0d9488', width: '18px', height: '18px', cursor: 'pointer' }} />
-                          <span style={{ fontWeight: 700, fontSize: '0.9rem', flex: 1 }}>{mt.icon} {isAr ? mt.ar : mt.en}</span>
-                          {subForm[mt.allowKey] !== false && mt.key !== 'snacks' && (
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                              <span style={{ fontSize: '0.78rem', color: '#64748b' }}>{isAr ? 'الحد الأقصى:' : 'Max:'}</span>
-                              <div style={{ display: 'flex', alignItems: 'center', border: '1.5px solid #0d9488', borderRadius: '8px', overflow: 'hidden' }}>
-                                <button type="button"
-                                  onClick={() => updateSub(mt.maxKey, Math.max(1, (subForm[mt.maxKey] || 1) - 1))}
-                                  style={{ width: '36px', height: '36px', border: 'none', background: '#f0fdfa', cursor: 'pointer', fontSize: '1.1rem', fontWeight: 700, color: '#0d9488' }}>
-                                  −
-                                </button>
-                                <span style={{ width: '36px', textAlign: 'center', fontWeight: 800, fontSize: '1rem', color: '#0f172a' }}>
-                                  {subForm[mt.maxKey] || 1}
-                                </span>
-                                <button type="button"
-                                  onClick={() => updateSub(mt.maxKey, Math.min(5, (subForm[mt.maxKey] || 1) + 1))}
-                                  style={{ width: '36px', height: '36px', border: 'none', background: '#f0fdfa', cursor: 'pointer', fontSize: '1.1rem', fontWeight: 700, color: '#0d9488' }}>
-                                  +
-                                </button>
-                              </div>
-                            </div>
-                          )}
-                          {subForm[mt.allowKey] !== false && mt.key === 'snacks' && (
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                              <span style={{ fontSize: '0.78rem', color: '#64748b' }}>{isAr ? 'العدد:' : 'Count:'}</span>
-                              <div style={{ display: 'flex', alignItems: 'center', border: '1.5px solid #0d9488', borderRadius: '8px', overflow: 'hidden' }}>
-                                <button type="button"
-                                  onClick={() => updateSub('snacksNumber', Math.max(1, (subForm.snacksNumber || 1) - 1))}
-                                  style={{ width: '36px', height: '36px', border: 'none', background: '#f0fdfa', cursor: 'pointer', fontSize: '1.1rem', fontWeight: 700, color: '#0d9488' }}>
-                                  −
-                                </button>
-                                <span style={{ width: '36px', textAlign: 'center', fontWeight: 800, fontSize: '1rem', color: '#0f172a' }}>
-                                  {subForm.snacksNumber || 1}
-                                </span>
-                                <button type="button"
-                                  onClick={() => updateSub('snacksNumber', Math.min(3, (subForm.snacksNumber || 1) + 1))}
-                                  style={{ width: '36px', height: '36px', border: 'none', background: '#f0fdfa', cursor: 'pointer', fontSize: '1.1rem', fontWeight: 700, color: '#0d9488' }}>
-                                  +
-                                </button>
-                              </div>
-                            </div>
-                          )}
+                    {/* البروتين */}
+                    <FSection icon="🍗" title={isAr ? 'البروتين (جرام)' : 'Protein (g)'}>
+                      <div style={{ display:'flex', flexWrap:'wrap', gap:7 }}>
+                        {(flexSettings.allowedProtein || PROTEIN_OPTIONS).map(v => (
+                          <FChip key={v} label={`${v}g`}
+                            active={String(subForm.protein) === String(v)}
+                            color="#c2410c" onClick={() => updateSub('protein', String(v))} />
+                        ))}
+                      </div>
+                    </FSection>
+
+                    {/* الكارب */}
+                    <FSection icon="🍚" title={isAr ? 'الكارب (جرام)' : 'Carbs (g)'}>
+                      <div style={{ display:'flex', flexWrap:'wrap', gap:7 }}>
+                        {(flexSettings.allowedCarbs || CARBS_OPTIONS).map(v => (
+                          <FChip key={v} label={`${v}g`}
+                            active={String(subForm.carbs) === String(v)}
+                            color="#92400e" onClick={() => updateSub('carbs', String(v))} />
+                        ))}
+                      </div>
+                    </FSection>
+
+                    {/* الوجبات */}
+                    <FSection icon="🍽️" title={`${isAr?'الوجبات اليومية':'Daily Meals'} (${flexSettings.minMealsPerDay||2}–${flexSettings.maxMealsPerDay||5})`}>
+                      {!mealsOk && totalMeals > 0 && (
+                        <div style={{ background:'#fef2f2', border:'1px solid #fecaca', borderRadius:7,
+                          padding:'6px 10px', marginBottom:8, fontSize:'0.76rem', color:'#dc2626' }}>
+                          ⚠️ {isAr?`الوجبات يجب بين ${flexSettings.minMealsPerDay||2} و ${flexSettings.maxMealsPerDay||5}`:`Meals must be between ${flexSettings.minMealsPerDay||2} and ${flexSettings.maxMealsPerDay||5}`}
                         </div>
+                      )}
+                      {[
+                        { key:'breakfast', icon:'🌅', label:isAr?'فطور':'Breakfast', allowKey:'allowBreakfast', maxKey:'allowedBreakfast', max:2 },
+                        { key:'lunch',     icon:'☀️',  label:isAr?'غداء':'Lunch',     allowKey:'allowLunch',     maxKey:'allowedLunch',     max:3 },
+                        { key:'dinner',    icon:'🌙', label:isAr?'عشاء':'Dinner',    allowKey:'allowDinner',    maxKey:'allowedDinner',    max:2 },
+                        { key:'snacks',    icon:'🥗', label:isAr?'سناك':'Snacks',    allowKey:'allowSnacks',    maxKey:'snacksNumber',     max:flexSettings.maxSnacks||3 },
+                      ].filter(m => m.key !== 'snacks' || (flexSettings.maxSnacks||3) > 0).map(m => (
+                        <FMealRow key={m.key}
+                          icon={m.icon} label={m.label}
+                          enabled={subForm[m.allowKey] !== false}
+                          count={subForm[m.maxKey] || 1}
+                          max={m.max}
+                          onToggle={() => updateSub(m.allowKey, subForm[m.allowKey] === false ? true : false)}
+                          onCount={c => updateSub(m.maxKey, c)}
+                        />
                       ))}
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '8px 14px', background: '#f1f5f9', borderRadius: '8px', marginTop: '8px', fontSize: '0.85rem', fontWeight: 700 }}>
-                        <span style={{ color: '#64748b' }}>{isAr ? 'إجمالي الوجبات اليومية:' : 'Total Daily Meals:'}</span>
-                        <span style={{ color: '#0d9488' }}>
-                          {(subForm.allowBreakfast !== false ? subForm.allowedBreakfast || 1 : 0) + (subForm.allowLunch !== false ? subForm.allowedLunch || 1 : 0) + (subForm.allowDinner !== false ? subForm.allowedDinner || 1 : 0)} {isAr ? 'وجبة' : 'meals'}
-                          {subForm.allowSnacks !== false && ` + ${subForm.snacksNumber || 1} ${isAr ? 'سناك' : 'snacks'}`}
+                      <div style={{ display:'flex', justifyContent:'space-between', padding:'7px 12px',
+                        borderRadius:8, marginTop:4, fontSize:'0.82rem', fontWeight:700,
+                        background: mealsOk ? '#f0fdfa' : '#fef9c3',
+                        border:`1px solid ${mealsOk?'#ccfbf1':'#fde68a'}` }}>
+                        <span style={{ color:'#64748b' }}>{isAr?'إجمالي الوجبات:':'Total Meals:'}</span>
+                        <span style={{ color: mealsOk ? '#0d9488' : '#b45309' }}>
+                          {totalMeals} {isAr?'وجبة':'meals'}
+                          {subForm.allowSnacks !== false && ` + ${subForm.snacksNumber||1} ${isAr?'سناك':'snacks'}`}
                         </span>
                       </div>
-                    </div>
+                    </FSection>
 
                     {/* أيام التوصيل */}
-                    <div className="section-title" style={{ marginBottom: '10px' }}>{isAr ? 'أيام التوصيل' : 'Delivery Days'}</div>
-                    <div className="days-grid" style={{ marginBottom: '16px' }}>
-                      {DAYS_AR.map((day, idx) => (
-                        <div key={idx} className="day-chip">
-                          <input type="checkbox" id={`day-${idx}`}
-                            checked={(subForm.deliveryDays || []).includes(idx)}
-                            onChange={e => {
-                              const days = subForm.deliveryDays || [];
-                              updateSub('deliveryDays', e.target.checked ? [...days, idx].sort() : days.filter(d => d !== idx));
-                            }} />
-                          <label htmlFor={`day-${idx}`}>{isAr ? day : DAYS_EN[idx]}</label>
+                    <FSection icon="📅"
+                      title={`${isAr?'أيام التوصيل':'Delivery Days'} — ${isAr?`${minDays}–${maxDays} أيام`:`${minDays}–${maxDays} days`}`}>
+                      <div style={{ fontSize:'0.74rem', color:'#64748b', marginBottom:8, display:'flex', gap:8, alignItems:'center' }}>
+                        <span>{isAr?'محدد:':'Selected:'} <strong style={{ color:'#0d9488' }}>{daysCount}</strong> {isAr?'يوم':'days'}</span>
+                        {!daysOk && daysCount > 0 && (
+                          <span style={{ color:'#dc2626' }}>⚠️ {isAr?`لازم ${minDays} أيام على الأقل`:`Min ${minDays} days required`}</span>
+                        )}
+                      </div>
+                      <div style={{ display:'grid', gridTemplateColumns:'repeat(7,1fr)', gap:5 }}>
+                        {DAYS_AR.map((day, idx) => {
+                          const active   = (subForm.deliveryDays||[]).includes(idx);
+                          const atMin    = daysCount <= minDays && active;
+                          const atMax    = daysCount >= maxDays && !active;
+                          const disabled = atMin || atMax;
+                          return (
+                            <button key={idx} type="button"
+                              title={day}
+                              onClick={() => {
+                                if (disabled) return;
+                                const days = subForm.deliveryDays || [];
+                                updateSub('deliveryDays', active ? days.filter(d=>d!==idx) : [...days,idx].sort());
+                              }}
+                              style={{
+                                padding:'9px 2px', borderRadius:8, fontFamily:'var(--font-main)',
+                                fontWeight:800, fontSize:'0.72rem', cursor:disabled&&!active?'not-allowed':'pointer',
+                                border:`2px solid ${active?'#0d9488':'#e2e8f0'}`,
+                                background: active?'#0d9488':'white',
+                                color: active?'white': disabled?'#cbd5e1':'#374151',
+                                opacity: disabled&&!active ? 0.4 : 1,
+                                transition:'all 0.15s',
+                              }}>
+                              {day.slice(0,3)}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      {daysCount > 0 && (
+                        <div style={{ marginTop:8, display:'flex', flexWrap:'wrap', gap:5 }}>
+                          {DAYS_AR.map((day,idx) => (subForm.deliveryDays||[]).includes(idx) && (
+                            <span key={idx} style={{ background:'#f0fdfa', color:'#0d9488', border:'1px solid #ccfbf1',
+                              borderRadius:99, padding:'2px 9px', fontSize:'0.72rem', fontWeight:700 }}>{day}</span>
+                          ))}
                         </div>
-                      ))}
-                    </div>
+                      )}
+                    </FSection>
+
+                    {/* المدة — chips */}
+                    <FSection icon="🗓️" title={isAr ? 'مدة الاشتراك' : 'Duration'}>
+                      <div style={{ display:'flex', flexWrap:'wrap', gap:7 }}>
+                        {(flexSettings.allowedDurations || [7,14,21,28,35,42,56,84]).sort((a,b)=>a-b).map(d => {
+                          const currentDays = subForm.durationDays || (subForm.durationWeeks||4)*7;
+                          return (
+                            <FChip key={d}
+                              label={DURATION_LABELS[d] || `${d} ${isAr?'يوم':'days'}`}
+                              active={currentDays === d}
+                              color="#7c3aed"
+                              onClick={() => { updateSub('durationDays', d); updateSub('durationWeeks', null); }}
+                            />
+                          );
+                        })}
+                      </div>
+                    </FSection>
 
                     {/* حساب السعر التلقائي */}
                     {(() => {
@@ -553,7 +739,8 @@ export default function NewSubscription() {
                       );
                     })()}
                   </div>
-                )}
+                  );
+                })()}
 
                 {/* المدة */}
                 <div className="section-title">{isAr ? 'مدة الاشتراك' : 'Duration'}</div>
@@ -561,6 +748,9 @@ export default function NewSubscription() {
                   <div className="form-group">
                     <label className="form-label">{isAr ? 'تاريخ البدء' : 'Start Date'} *</label>
                     <input className="form-control" type="date" value={subForm.startDate} onChange={e => updateSub('startDate', e.target.value)} />
+                    <div style={{ fontSize:'0.72rem', color:'#0d9488', marginTop:4 }}>
+                      📅 {isAr ? 'محسوب تلقائياً من إعدادات ساعات الاشتراك — يمكن تعديله' : 'Auto-calculated from subscription lead hours — editable'}
+                    </div>
                   </div>
                   <div className="form-group">
                     <label className="form-label">{isAr ? 'المدة' : 'Duration'}</label>
@@ -602,6 +792,50 @@ export default function NewSubscription() {
                     <div className="form-group">
                       <label className="form-label">{isAr ? 'المبلغ (KWD)' : 'Amount (KWD)'}</label>
                       <input className="form-control" type="number" placeholder="0.000" value={subForm.paymentAmount} onChange={e => updateSub('paymentAmount', e.target.value)} />
+                    </div>
+                  )}
+                </div>
+
+                {/* كوبون الخصم */}
+                <div className="section-title">🎟 {isAr ? 'كوبون الخصم' : 'Discount Coupon'}</div>
+                <div style={{ marginBottom:'20px' }}>
+                  {!couponData ? (
+                    <div style={{ display:'flex', gap:'10px', alignItems:'flex-end' }}>
+                      <div className="form-group" style={{ flex:1, marginBottom:0 }}>
+                        <label className="form-label">{isAr?'كود الخصم (اختياري)':'Coupon Code (optional)'}</label>
+                        <input className="form-control"
+                          value={couponCode}
+                          onChange={e => { setCouponCode(e.target.value.toUpperCase()); setCouponError(''); }}
+                          placeholder="SUMMER25"
+                          style={{ fontFamily:'monospace', fontWeight:700, letterSpacing:'2px' }}
+                          onKeyDown={e => e.key==='Enter' && applyCoupon()} />
+                        {couponError && <div style={{ color:'#dc2626', fontSize:'0.78rem', marginTop:'4px' }}>❌ {couponError}</div>}
+                      </div>
+                      <button className="btn btn-outline" onClick={applyCoupon} disabled={couponLoading || !couponCode} style={{ padding:'10px 20px', whiteSpace:'nowrap' }}>
+                        {couponLoading ? '...' : (isAr?'تطبيق':'Apply')}
+                      </button>
+                    </div>
+                  ) : (
+                    <div style={{ background:'#f0fdfa', border:'1px solid #0d9488', borderRadius:'10px', padding:'14px 18px', display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+                      <div>
+                        <div style={{ display:'flex', alignItems:'center', gap:'10px' }}>
+                          <span style={{ fontFamily:'monospace', fontWeight:800, fontSize:'1.1rem', color:'#0d9488', letterSpacing:'2px' }}>{couponData.code}</span>
+                          <span style={{ background:'#dcfce7', color:'#16a34a', padding:'2px 8px', borderRadius:'6px', fontSize:'0.75rem', fontWeight:700 }}>✅ {isAr?'مطبّق':'Applied'}</span>
+                        </div>
+                        <div style={{ fontSize:'0.82rem', color:'#0f766e', marginTop:'4px' }}>
+                          {couponData.discountType==='percentage'
+                            ? `${isAr?'خصم':'Discount'} ${couponData.discountValue}%${couponData.maxDiscount?` (${isAr?'أقصى':'max'} ${couponData.maxDiscount} KWD)`:''}`
+                            : `${isAr?'خصم':'Discount'} ${couponData.discountValue} KWD`}
+                        </div>
+                        {subForm.paymentAmount && (
+                          <div style={{ fontSize:'0.82rem', color:'#7c3aed', fontWeight:700, marginTop:'4px' }}>
+                            {isAr?'قيمة الخصم':'Discount amount'}: {calcDiscount(couponData, Number(subForm.paymentAmount)).toFixed(3)} KWD
+                            {' → '}
+                            {isAr?'الإجمالي':'Total'}: {(Number(subForm.paymentAmount) - calcDiscount(couponData, Number(subForm.paymentAmount))).toFixed(3)} KWD
+                          </div>
+                        )}
+                      </div>
+                      <button onClick={removeCoupon} style={{ background:'none', border:'none', cursor:'pointer', color:'#dc2626', fontSize:'1.2rem' }}>✕</button>
                     </div>
                   )}
                 </div>

@@ -2,19 +2,25 @@ import { useState, useEffect } from 'react';
 import { getClients } from '../firebase/clientService';
 import { getClientDailyMeals } from '../firebase/mealService';
 import { getClientSubscriptions, getSubscriptionStatus } from '../firebase/subscriptionService';
+import { db } from '../firebase/config';
+import { collection, getDocs } from 'firebase/firestore';
 import StickerLabel from '../components/StickerLabel';
 import { useLang } from '../LanguageContext';
 
 export default function LabelsPage() {
   const { lang, isAr } = useLang();
   const [clients, setClients] = useState([]);
+  const [allMeals, setAllMeals] = useState([]);
   const [selectedDate, setSelectedDate] = useState(new Date().toISOString().split('T')[0]);
   const [clientsWithMeals, setClientsWithMeals] = useState([]);
   const [selected, setSelected] = useState([]);
   const [loading, setLoading] = useState(false);
   const [fetched, setFetched] = useState(false);
 
-  useEffect(() => { getClients().then(setClients); }, []);
+  useEffect(() => {
+    getClients().then(setClients);
+    getDocs(collection(db, 'meals')).then(snap => setAllMeals(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
+  }, []);
 
   const fetchAllMeals = async () => {
     setLoading(true); setFetched(false);
@@ -161,7 +167,7 @@ export default function LabelsPage() {
             </div>
             <div style={{ display:'flex', flexWrap:'wrap', gap:'16px' }}>
               {selectedClients.map((c, i) => (
-                <StickerLabel
+                <StickerLabel allMeals={allMeals}
                   key={`${c.id}-${lang}`}
                   client={c}
                   activeSub={c.activeSub}
@@ -186,7 +192,7 @@ export default function LabelsPage() {
           }
         `}</style>
         {selectedClients.map((c, i) => (
-          <StickerLabel
+          <StickerLabel allMeals={allMeals}
             key={`print-${c.id}-${lang}`}
             client={c}
             activeSub={c.activeSub}

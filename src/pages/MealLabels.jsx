@@ -74,6 +74,8 @@ export default function MealLabels() {
         s => s.clientId === client.id && getSubscriptionStatus(s) === 'active'
       );
       if (!activeSub) continue; // تجاهل العملاء بدون اشتراك نشط
+      // تجاهل العملاء اللي اليوم مجمّد في اشتراكهم
+      if ((activeSub.frozenDays || []).includes(selectedDate)) continue;
       const proteinWeight = Number(activeSub?.protein || client.protein || 100);
       const carbsWeight   = Number(activeSub?.carbs   || client.carbs   || 100);
       // gramSize للتجميع في تقرير التصنيع = protein weight

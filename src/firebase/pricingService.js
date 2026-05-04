@@ -34,6 +34,50 @@ export const savePricingSettings = async (settings) => {
 };
 
 // ─────────────────────────────────────────────
+// مدد الاشتراك المتاحة (مشتركة مع PackagesPage)
+// ─────────────────────────────────────────────
+export const DURATION_OPTIONS = [
+  { label: '1 أسبوع',   days: 7  },
+  { label: '2 أسبوع',   days: 14 },
+  { label: '3 أسابيع',  days: 21 },
+  { label: '20 يوم',    days: 20 },
+  { label: '26 يوم',    days: 26 },
+  { label: '1 شهر',     days: 28 },
+  { label: '5 أسابيع',  days: 35 },
+  { label: '6 أسابيع',  days: 42 },
+  { label: '2 شهر',     days: 56 },
+  { label: '3 شهور',    days: 84 },
+];
+
+// ─────────────────────────────────────────────
+// إعدادات الباقة المرنة
+// ─────────────────────────────────────────────
+const FLEX_DOC = 'flexSettings';
+
+export const DEFAULT_FLEX_SETTINGS = {
+  showOnWebsite:    false,
+  allowedProtein:   [80, 90, 100, 120, 150, 180, 200],
+  allowedCarbs:     [50, 80, 100, 120, 150, 200],
+  allowedDurations: [7, 14, 21, 20, 26, 28, 35, 42, 56, 84],
+  minDaysPerWeek:   5,
+  maxDaysPerWeek:   6,
+  minMealsPerDay:   2,
+  maxMealsPerDay:   5,
+  minSnacks:        0,
+  maxSnacks:        3,
+  maxFreezeDays:    0,
+};
+
+export const getFlexSettings = async () => {
+  const snap = await getDoc(doc(db, CONFIG_COL, FLEX_DOC));
+  return snap.exists() ? { ...DEFAULT_FLEX_SETTINGS, ...snap.data() } : { ...DEFAULT_FLEX_SETTINGS };
+};
+
+export const saveFlexSettings = async (settings) => {
+  await setDoc(doc(db, CONFIG_COL, FLEX_DOC), { ...settings, updatedAt: serverTimestamp() });
+};
+
+// ─────────────────────────────────────────────
 // حساب سعر الباقة المرنة
 // ─────────────────────────────────────────────
 export const calcCustomPrice = (subForm, pricing, totalDays) => {

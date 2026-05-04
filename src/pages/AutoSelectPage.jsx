@@ -4,6 +4,11 @@ import {
   runAutoSelect, getAutoSelectLog, checkAndRunScheduled,
 } from '../firebase/autoSelectService';
 import { useLang } from '../LanguageContext';
+import { db } from '../firebase/config';
+import { collection, getDocs, doc, updateDoc, query, where } from 'firebase/firestore';
+import { getAllSubscriptions, getSubscriptionStatus } from '../firebase/subscriptionService';
+import { saveClientDailyMeals } from '../firebase/mealService';
+import { getPackages } from '../firebase/packageService';
 
 export default function AutoSelectPage() {
   const { isAr } = useLang();
@@ -15,6 +20,17 @@ export default function AutoSelectPage() {
   const [saving, setSaving]       = useState(false);
   const [msg, setMsg]             = useState({ text: '', type: '' });
   const [lastResult, setLastResult] = useState(null);
+
+  // ── تجميد/إلغاء جماعي ──
+  const [bulkTab, setBulkTab]         = useState('freeze'); // freeze | delete
+  const [bulkDate, setBulkDate]       = useState('');
+  const [bulkDateTo, setBulkDateTo]   = useState('');
+  const [bulkMode, setBulkMode]       = useState('single'); // single | range
+  const [bulkRunning, setBulkRunning]     = useState(false);
+  const [bulkResult, setBulkResult]       = useState(null);
+  const [logOpen, setLogOpen]               = useState(false);
+  const [migrateRunning, setMigrateRunning] = useState(false);
+  const [migrateResult, setMigrateResult]   = useState(null);
 
   const showMsg = (text, type = 'success') => {
     setMsg({ text, type });
@@ -54,6 +70,132 @@ export default function AutoSelectPage() {
       showMsg(isAr ? '❌ حدث خطأ' : '❌ Error occurred', 'error');
     }
     setRunning(false);
+  };
+
+  // ── دالة التجميد الجماعي ──
+  const handleBulkFreeze = async () => {
+    if (!bulkDate) return;
+    if (!window.confirm(isAr
+      ? `تجميد يوم ${bulkDate} لكل المشتركين النشطين؟ سيتم تمديد اشتراكاتهم يوماً تلقائياً`
+      : `Freeze ${bulkDate} for all active subscribers?`)) return;
+
+    setBulkRunning(true); setBulkResult(null);
+    try {
+      const allSubs = await getAllSubscriptions();
+      const activeSubs = allSubs.filter(s => getSubscriptionStatus(s) === 'active');
+
+      // توليد قائمة التواريخ (يوم واحد أو نطاق)
+      const dates = [];
+      if (bulkMode === 'single') {
+        dates.push(bulkDate);
+      } else {
+        const from = new Date(bulkDate);
+        const to   = new Date(bulkDateTo || bulkDate);
+        for (let d = new Date(from); d <= to; d.setDate(d.getDate() + 1)) {
+          dates.push(d.toISOString().split('T')[0]);
+        }
+      }
+
+      let count = 0;
+      for (const sub of activeSubs) {
+        const frozenDays = sub.frozenDays || [];
+        const newDays = dates.filter(d => !frozenDays.includes(d));
+        if (newDays.length === 0) continue;
+        // تمديد الاشتراك
+        const endDate = new Date(sub.endDate);
+        endDate.setDate(endDate.getDate() + newDays.length);
+        await updateDoc(doc(db, 'subscriptions', sub.id), {
+          frozenDays: [...frozenDays, ...newDays],
+          endDate: endDate.toISOString().split('T')[0],
+          bonusDays: (sub.bonusDays || 0) + newDays.length,
+        });
+        count++;
+      }
+
+      setBulkResult({ count, dates });
+      showMsg(isAr
+        ? `✅ تم تجميد ${dates.length} يوم لـ ${count} مشترك وتمديد اشتراكاتهم`
+        : `✅ Frozen ${dates.length} day(s) for ${count} subscribers`);
+    } catch (e) {
+      showMsg(isAr ? '❌ حدث خطأ' : '❌ Error', 'error');
+    }
+    setBulkRunning(false);
+  };
+
+  // ── دالة حذف اختيارات يوم ──
+  const handleBulkDeleteMeals = async () => {
+    if (!bulkDate) return;
+    if (!window.confirm(isAr
+      ? `حذف اختيارات وجبات ${bulkDate === bulkDateTo || bulkMode === 'single' ? bulkDate : `من ${bulkDate} إلى ${bulkDateTo}`} لكل المشتركين؟`
+      : `Delete meals for selected dates?`)) return;
+
+    setBulkRunning(true); setBulkResult(null);
+    try {
+      const dates = [];
+      if (bulkMode === 'single') {
+        dates.push(bulkDate);
+      } else {
+        const from = new Date(bulkDate);
+        const to   = new Date(bulkDateTo || bulkDate);
+        for (let d = new Date(from); d <= to; d.setDate(d.getDate() + 1)) {
+          dates.push(d.toISOString().split('T')[0]);
+        }
+      }
+
+      const snap = await getDocs(collection(db, 'clientDailyMeals'));
+      let count = 0;
+      for (const docSnap of snap.docs) {
+        const data = docSnap.data();
+        if (dates.includes(data.date)) {
+          await updateDoc(doc(db, 'clientDailyMeals', docSnap.id), {
+            meals: { افطار: [], غداء: [], عشاء: [], سناك: [] }
+          });
+          count++;
+        }
+      }
+
+      setBulkResult({ count, dates });
+      showMsg(isAr
+        ? `✅ تم حذف اختيارات ${count} عميل ليوم ${dates.join('، ')}`
+        : `✅ Cleared meals for ${count} clients`);
+    } catch (e) {
+      showMsg(isAr ? '❌ حدث خطأ' : '❌ Error', 'error');
+    }
+    setBulkRunning(false);
+  };
+
+  // ── ترحيل الاشتراكات القديمة: تعبئة deliveryDays من إعدادات الباقة ──
+  const handleMigrateDeliveryDays = async (previewOnly = false) => {
+    setMigrateRunning(true); setMigrateResult(null);
+    try {
+      const [allSubs, allPackages] = await Promise.all([getAllSubscriptions(), getPackages()]);
+      const pkgMap = {};
+      for (const p of allPackages) pkgMap[p.id] = p;
+
+      const toMigrate = allSubs.filter(s => !s.deliveryDays || s.deliveryDays.length === 0);
+
+      if (previewOnly) {
+        setMigrateResult({ preview: true, count: toMigrate.length, subs: toMigrate.slice(0, 10) });
+        setMigrateRunning(false);
+        return;
+      }
+
+      let updated = 0;
+      for (const sub of toMigrate) {
+        const pkg = pkgMap[sub.packageId];
+        const deliveryDays = pkg?.fridays === true
+          ? [0, 1, 2, 3, 4, 5, 6]  // 7 أيام شاملة الجمعة
+          : [0, 1, 2, 3, 4, 5];    // 6 أيام بدون الجمعة (الافتراضي)
+        await updateDoc(doc(db, 'subscriptions', sub.id), { deliveryDays });
+        updated++;
+      }
+
+      setMigrateResult({ preview: false, count: updated });
+      showMsg(isAr ? `✅ تم تحديث ${updated} اشتراك` : `✅ Updated ${updated} subscriptions`);
+    } catch (e) {
+      showMsg(isAr ? '❌ حدث خطأ' : '❌ Error', 'error');
+    }
+    setMigrateRunning(false);
   };
 
   const fmtDate = (iso) => {
@@ -212,6 +354,72 @@ export default function AutoSelectPage() {
                 </div>
               </div>
 
+              {/* مدة فتح الاختيار للعميل */}
+              <div className="section-title">{isAr ? '📱 مدة فتح الاختيار للعميل' : '📱 Client Order Window'}</div>
+              <div className="form-group" style={{ marginBottom: '20px' }}>
+                <label className="form-label">
+                  {isAr ? 'يُسمح للعميل باختيار وجباته قبل يوم التوصيل بـ' : 'Allow client to choose meals before delivery by'}
+                </label>
+                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '8px' }}>
+                  {[24, 48, 72, 96, 120].map(h => (
+                    <button key={h}
+                      onClick={() => setSettings(p => ({ ...p, orderLeadHours: h }))}
+                      style={{
+                        padding: '8px 20px', borderRadius: '8px', border: 'none',
+                        cursor: 'pointer', fontFamily: 'var(--font-main)',
+                        fontWeight: 700, fontSize: '0.9rem', transition: 'all 0.2s',
+                        background: (settings?.orderLeadHours ?? 72) === h ? '#7c3aed' : '#f1f5f9',
+                        color: (settings?.orderLeadHours ?? 72) === h ? 'white' : '#64748b',
+                        boxShadow: (settings?.orderLeadHours ?? 72) === h ? '0 2px 8px rgba(124,58,237,0.3)' : 'none',
+                      }}>
+                      {h}h
+                    </button>
+                  ))}
+                </div>
+                <div style={{ marginTop: '8px', fontSize: '0.78rem', color: '#94a3b8' }}>
+                  {isAr
+                    ? `العميل يقدر يختار وجبات اليوم ${new Date(Date.now() + (settings?.orderLeadHours ?? 72) * 3600000).toLocaleDateString('ar-KW')} فأكثر`
+                    : `Client can choose meals for ${new Date(Date.now() + (settings?.orderLeadHours ?? 72) * 3600000).toLocaleDateString('en-GB')} and beyond`
+                  }
+                </div>
+                <div style={{ marginTop:'6px', padding:'8px 12px', background:'#faf5ff', borderRadius:'8px', fontSize:'0.78rem', color:'#7c3aed', border:'1px solid #ede9fe' }}>
+                  ⚠️ {isAr
+                    ? `لو العميل ماخترش قبل الـ ${settings?.offsetHours || 48}h — الكرون يختارله تلقائياً`
+                    : `If client doesn't choose before ${settings?.offsetHours || 48}h — auto-select runs`
+                  }
+                </div>
+              </div>
+
+              {/* حد أدنى لبداية الاشتراك */}
+              <div className="section-title">{isAr ? '📅 حد أدنى لبداية الاشتراك' : '📅 Min Subscription Start'}</div>
+              <div className="form-group" style={{ marginBottom: '20px' }}>
+                <label className="form-label">
+                  {isAr ? 'أقل وقت بين تسجيل الاشتراك وأول توصيل (ساعة)' : 'Min hours between registration and first delivery'}
+                </label>
+                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '8px' }}>
+                  {[24, 48, 72, 96].map(h => (
+                    <button key={h}
+                      onClick={() => setSettings(p => ({ ...p, subscriptionLeadHours: h }))}
+                      style={{
+                        padding: '8px 20px', borderRadius: '8px', border: 'none',
+                        cursor: 'pointer', fontFamily: 'var(--font-main)',
+                        fontWeight: 700, fontSize: '0.9rem', transition: 'all 0.2s',
+                        background: (settings?.subscriptionLeadHours ?? 72) === h ? '#0d9488' : '#f1f5f9',
+                        color: (settings?.subscriptionLeadHours ?? 72) === h ? 'white' : '#64748b',
+                        boxShadow: (settings?.subscriptionLeadHours ?? 72) === h ? '0 2px 8px rgba(13,148,136,0.3)' : 'none',
+                      }}>
+                      {h}h
+                    </button>
+                  ))}
+                </div>
+                <div style={{ marginTop: '8px', fontSize: '0.78rem', color: '#94a3b8' }}>
+                  {isAr
+                    ? `أقرب تاريخ بداية اشتراك = اليوم + ${settings?.subscriptionLeadHours ?? 72}h = ${new Date(Date.now() + (settings?.subscriptionLeadHours ?? 72) * 3600000).toLocaleDateString('ar-KW')}`
+                    : `Earliest start = today + ${settings?.subscriptionLeadHours ?? 72}h = ${new Date(Date.now() + (settings?.subscriptionLeadHours ?? 72) * 3600000).toLocaleDateString('en-GB')}`
+                  }
+                </div>
+              </div>
+
               {/* ملاحظة */}
               <div style={{
                 background: '#f0fdfa', border: '1px solid #ccfbf1',
@@ -289,49 +497,212 @@ export default function AutoSelectPage() {
 
         {/* ── سجل التشغيل ── */}
         <div className="card">
-          <div className="card-header">
+          <div
+            className="card-header"
+            onClick={() => setLogOpen(o => !o)}
+            style={{ cursor: 'pointer', userSelect: 'none' }}
+          >
             <h3>📋 {isAr ? 'سجل التشغيل' : 'Run Log'}</h3>
-            <span className="badge badge-teal">{log.length} {isAr ? 'عملية' : 'runs'}</span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+              <span className="badge badge-teal">{log.length} {isAr ? 'عملية' : 'runs'}</span>
+              <span style={{ color: '#94a3b8', fontSize: '1rem' }}>{logOpen ? '▲' : '▼'}</span>
+            </div>
           </div>
-          <div className="table-wrapper">
-            {log.length === 0 ? (
-              <div className="empty-state">
-                <div className="empty-icon">📋</div>
-                <h3>{isAr ? 'لا يوجد سجل بعد' : 'No log yet'}</h3>
-              </div>
-            ) : (
-              <table>
-                <thead>
-                  <tr>
-                    <th>{isAr ? 'وقت التشغيل' : 'Run Time'}</th>
-                    <th>{isAr ? 'تاريخ التوصيل' : 'Delivery Date'}</th>
-                    <th>{isAr ? 'تم اختيارهم' : 'Selected'}</th>
-                    <th>{isAr ? 'تخطي' : 'Skipped'}</th>
-                    <th>{isAr ? 'أخطاء' : 'Errors'}</th>
-                    <th>{isAr ? 'مدة' : 'Duration'}</th>
-                    <th>{isAr ? 'النوع' : 'Type'}</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {log.map((entry, i) => (
-                    <tr key={i} className="fade-in">
-                      <td style={{ fontSize: '0.82rem' }}>{fmtDate(entry.runAt)}</td>
-                      <td><strong>{fmtDateShort(entry.deliveryDate)}</strong></td>
-                      <td>
-                        <span style={{ color: '#16a34a', fontWeight: 700 }}>{entry.processed}</span>
-                      </td>
-                      <td style={{ color: '#d97706' }}>{entry.skipped}</td>
-                      <td style={{ color: entry.errors > 0 ? '#dc2626' : '#94a3b8' }}>{entry.errors}</td>
-                      <td style={{ fontSize: '0.82rem', color: '#94a3b8' }}>{entry.duration}s</td>
-                      <td>
-                        <span className={`badge ${entry.manual ? 'badge-orange' : 'badge-teal'}`}>
-                          {entry.manual ? (isAr ? 'يدوي' : 'Manual') : (isAr ? 'تلقائي' : 'Auto')}
-                        </span>
-                      </td>
+          {logOpen && (
+            <div className="table-wrapper">
+              {log.length === 0 ? (
+                <div className="empty-state">
+                  <div className="empty-icon">📋</div>
+                  <h3>{isAr ? 'لا يوجد سجل بعد' : 'No log yet'}</h3>
+                </div>
+              ) : (
+                <table>
+                  <thead>
+                    <tr>
+                      <th>{isAr ? 'وقت التشغيل' : 'Run Time'}</th>
+                      <th>{isAr ? 'تاريخ التوصيل' : 'Delivery Date'}</th>
+                      <th>{isAr ? 'تم اختيارهم' : 'Selected'}</th>
+                      <th>{isAr ? 'تخطي' : 'Skipped'}</th>
+                      <th>{isAr ? 'أخطاء' : 'Errors'}</th>
+                      <th>{isAr ? 'مدة' : 'Duration'}</th>
+                      <th>{isAr ? 'النوع' : 'Type'}</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {log.map((entry, i) => (
+                      <tr key={i} className="fade-in">
+                        <td style={{ fontSize: '0.82rem' }}>{fmtDate(entry.runAt)}</td>
+                        <td><strong>{fmtDateShort(entry.deliveryDate)}</strong></td>
+                        <td><span style={{ color: '#16a34a', fontWeight: 700 }}>{entry.processed}</span></td>
+                        <td style={{ color: '#d97706' }}>{entry.skipped}</td>
+                        <td style={{ color: entry.errors > 0 ? '#dc2626' : '#94a3b8' }}>{entry.errors}</td>
+                        <td style={{ fontSize: '0.82rem', color: '#94a3b8' }}>{entry.duration}s</td>
+                        <td>
+                          <span className={`badge ${entry.manual ? 'badge-orange' : 'badge-teal'}`}>
+                            {entry.manual ? (isAr ? 'يدوي' : 'Manual') : (isAr ? 'تلقائي' : 'Auto')}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ── قسم الإجراءات الجماعية ── */}
+      <div className="page-body" style={{ paddingTop: 0 }}>
+        <div className="card">
+          <div className="card-header">
+            <h3>⚡ {isAr ? 'الإجراءات الجماعية' : 'Bulk Operations'}</h3>
+          </div>
+          <div className="card-body">
+
+            {/* Tabs */}
+            <div style={{ display:'flex', gap:'4px', marginBottom:'20px', borderBottom:'2px solid #e2e8f0' }}>
+              {[
+                { key:'freeze',  label: isAr?'❄️ تجميد يوم لكل المشتركين':'❄️ Bulk Freeze Day' },
+                { key:'delete',  label: isAr?'🗑 حذف اختيارات الوجبات':'🗑 Clear Meal Selections' },
+                { key:'migrate', label: isAr?'🔧 ترحيل الاشتراكات القديمة':'🔧 Migrate Old Subscriptions' },
+              ].map(t => (
+                <button key={t.key} onClick={() => setBulkTab(t.key)}
+                  style={{ padding:'8px 16px', border:'none', background:'none', fontFamily:'var(--font-main)', fontSize:'0.88rem', fontWeight:600, cursor:'pointer',
+                    color: bulkTab===t.key?'#0d9488':'#64748b',
+                    borderBottom: bulkTab===t.key?'2px solid #0d9488':'2px solid transparent', marginBottom:'-2px' }}>
+                  {t.label}
+                </button>
+              ))}
+            </div>
+
+            {/* وضع التحديد: يوم واحد أو نطاق */}
+            <div style={{ display:'flex', gap:'8px', marginBottom:'16px' }}>
+              {[{k:'single',l:isAr?'يوم واحد':'Single Day'},{k:'range',l:isAr?'نطاق تواريخ':'Date Range'}].map(m=>(
+                <label key={m.k} style={{ display:'flex', alignItems:'center', gap:'6px', cursor:'pointer', padding:'6px 14px', borderRadius:'8px', border:`1.5px solid ${bulkMode===m.k?'#0d9488':'#e2e8f0'}`, background:bulkMode===m.k?'#f0fdfa':'white', fontWeight:600, fontSize:'0.85rem' }}>
+                  <input type="radio" checked={bulkMode===m.k} onChange={()=>setBulkMode(m.k)} style={{ accentColor:'#0d9488' }} />
+                  {m.l}
+                </label>
+              ))}
+            </div>
+
+            {/* التواريخ */}
+            <div style={{ display:'flex', gap:'12px', alignItems:'flex-end', flexWrap:'wrap', marginBottom:'16px' }}>
+              <div className="form-group" style={{ marginBottom:0 }}>
+                <label className="form-label">{isAr ? (bulkMode==='range'?'من تاريخ':'التاريخ') : (bulkMode==='range'?'From':'Date')}</label>
+                <input type="date" className="form-control" value={bulkDate} onChange={e=>setBulkDate(e.target.value)} />
+              </div>
+              {bulkMode === 'range' && (
+                <div className="form-group" style={{ marginBottom:0 }}>
+                  <label className="form-label">{isAr?'إلى تاريخ':'To'}</label>
+                  <input type="date" className="form-control" value={bulkDateTo} onChange={e=>setBulkDateTo(e.target.value)} min={bulkDate} />
+                </div>
+              )}
+              {bulkMode === 'range' && bulkDate && bulkDateTo && (
+                <div style={{ padding:'10px 14px', background:'#f0fdfa', borderRadius:'8px', fontSize:'0.82rem', color:'#0f766e', fontWeight:700 }}>
+                  {Math.ceil((new Date(bulkDateTo)-new Date(bulkDate))/(1000*60*60*24))+1} {isAr?'يوم':'days'}
+                </div>
+              )}
+            </div>
+
+            {/* الوصف */}
+            {bulkTab === 'freeze' && (
+              <div style={{ background:'#fef3c7', border:'1px solid #fde68a', borderRadius:'8px', padding:'10px 14px', marginBottom:'16px', fontSize:'0.82rem', color:'#92400e' }}>
+                ⚠️ {isAr
+                  ? 'سيتم تجميد التاريخ المحدد لكل المشتركين النشطين وتمديد اشتراكاتهم تلقائياً تعويضاً عن الأيام المجمدة'
+                  : 'Will freeze the selected date(s) for all active subscribers and extend their subscriptions automatically'}
+              </div>
+            )}
+            {bulkTab === 'delete' && (
+              <div style={{ background:'#fee2e2', border:'1px solid #fecaca', borderRadius:'8px', padding:'10px 14px', marginBottom:'16px', fontSize:'0.82rem', color:'#991b1b' }}>
+                ⚠️ {isAr
+                  ? 'سيتم حذف اختيارات الوجبات للتاريخ المحدد لكل العملاء — استخدم هذا عند تغيير المنيو'
+                  : 'Will clear meal selections for all clients on selected date(s) — use when changing the menu'}
+              </div>
+            )}
+
+            {/* زر التنفيذ — freeze / delete */}
+            {bulkTab !== 'migrate' && (
+              <>
+                <button
+                  className={`btn ${bulkTab==='freeze'?'btn-primary':'btn-danger'}`}
+                  onClick={bulkTab==='freeze'?handleBulkFreeze:handleBulkDeleteMeals}
+                  disabled={bulkRunning || !bulkDate}
+                  style={{ padding:'10px 28px' }}>
+                  {bulkRunning
+                    ? <><div className="spinner" style={{width:'16px',height:'16px',borderWidth:'2px'}}/> {isAr?'جاري التنفيذ...':'Processing...'}</>
+                    : bulkTab==='freeze'
+                      ? `❄️ ${isAr?'تجميد للكل':'Freeze for All'}`
+                      : `🗑 ${isAr?'حذف الاختيارات':'Clear Selections'}`}
+                </button>
+                {bulkResult && (
+                  <div style={{ marginTop:'16px', padding:'14px', background:'#f0fdfa', borderRadius:'10px', border:'1px solid #ccfbf1' }}>
+                    <div style={{ fontWeight:700, color:'#0d9488', marginBottom:'6px' }}>{isAr?'نتيجة العملية:':'Result:'}</div>
+                    <div style={{ fontSize:'0.85rem', color:'#0f766e' }}>
+                      {bulkTab==='freeze'
+                        ? `✅ ${isAr?`تم تجميد ${bulkResult.dates?.length} يوم لـ ${bulkResult.count} مشترك وتمديد اشتراكاتهم تلقائياً`:`Frozen ${bulkResult.dates?.length} day(s) for ${bulkResult.count} subscribers`}`
+                        : `✅ ${isAr?`تم حذف اختيارات ${bulkResult.count} عميل`:`Cleared ${bulkResult.count} client selections`}`}
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
+
+            {/* ── تبويب الترحيل ── */}
+            {bulkTab === 'migrate' && (
+              <div>
+                <div style={{ background:'#fef9c3', border:'1px solid #fde68a', borderRadius:'10px', padding:'14px 16px', marginBottom:'16px', fontSize:'0.85rem', color:'#92400e' }}>
+                  <strong>🔧 {isAr?'ما الذي يفعله هذا؟':'What does this do?'}</strong>
+                  <br/>
+                  {isAr
+                    ? 'يبحث عن الاشتراكات القديمة التي ليس بها حقل "أيام التوصيل" ويضيفه تلقائياً من إعدادات الباقة. الباقات التي تشمل الجمعة → 7 أيام، غير ذلك → 6 أيام (بدون جمعة).'
+                    : 'Finds old subscriptions missing the "deliveryDays" field and sets it from the package settings. Packages with Fridays → 7 days, otherwise → 6 days (no Friday).'}
+                </div>
+
+                <div style={{ display:'flex', gap:'12px', flexWrap:'wrap' }}>
+                  <button
+                    className="btn btn-outline"
+                    onClick={() => handleMigrateDeliveryDays(true)}
+                    disabled={migrateRunning}
+                    style={{ padding:'10px 24px' }}>
+                    {migrateRunning
+                      ? <><div className="spinner" style={{width:'16px',height:'16px',borderWidth:'2px'}}/> {isAr?'جاري...':'Loading...'}</>
+                      : `🔍 ${isAr?'معاينة (كم اشتراك يحتاج تحديث؟)':'Preview (how many need update?)'}`}
+                  </button>
+                  <button
+                    className="btn btn-primary"
+                    onClick={() => handleMigrateDeliveryDays(false)}
+                    disabled={migrateRunning}
+                    style={{ padding:'10px 24px' }}>
+                    {migrateRunning
+                      ? <><div className="spinner" style={{width:'16px',height:'16px',borderWidth:'2px'}}/> {isAr?'جاري التحديث...':'Updating...'}</>
+                      : `✅ ${isAr?'تطبيق التحديث على الكل':'Apply Update to All'}`}
+                  </button>
+                </div>
+
+                {migrateResult && (
+                  <div style={{ marginTop:'16px', padding:'14px', background: migrateResult.preview?'#f8fafc':'#f0fdfa', borderRadius:'10px', border:`1px solid ${migrateResult.preview?'#e2e8f0':'#ccfbf1'}` }}>
+                    {migrateResult.preview ? (
+                      <>
+                        <div style={{ fontWeight:700, color:'#0f172a', marginBottom:'10px' }}>
+                          🔍 {isAr?`وُجد ${migrateResult.count} اشتراك يحتاج إلى تحديث`:`Found ${migrateResult.count} subscriptions needing update`}
+                        </div>
+                        {migrateResult.subs?.length > 0 && (
+                          <div style={{ fontSize:'0.78rem', color:'#64748b' }}>
+                            {isAr?'أمثلة:':'Examples:'}&nbsp;
+                            {migrateResult.subs.map(s => s.clientName || s.clientId).join(' ، ')}
+                            {migrateResult.count > 10 && ` ... ${isAr?'وغيرهم':'and more'}`}
+                          </div>
+                        )}
+                      </>
+                    ) : (
+                      <div style={{ fontWeight:700, color:'#0d9488' }}>
+                        ✅ {isAr?`تم تحديث ${migrateResult.count} اشتراك بنجاح`:`Successfully updated ${migrateResult.count} subscriptions`}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
             )}
           </div>
         </div>

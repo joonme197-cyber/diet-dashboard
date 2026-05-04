@@ -109,12 +109,26 @@ export const addPayment = async (subscriptionId, payment) => {
 // =====================
 // حساب حالة الاشتراك
 // =====================
+// تحقق إن تاريخ معين هو يوم توصيل فعلي للاشتراك
+// ترتيب الأيام في النظام: 0=سبت, 1=أحد, 2=اثنين, 3=ثلاثاء, 4=أربعاء, 5=خميس, 6=جمعة
+export const isDeliveryDay = (sub, dateStr) => {
+  const jsToSys = [1, 2, 3, 4, 5, 6, 0]; // JS getDay() (0=أحد..6=سبت) → ترتيب النظام
+  const dayIdx = jsToSys[new Date(dateStr).getDay()];
+  if (sub.deliveryDays?.length > 0) {
+    return sub.deliveryDays.includes(dayIdx);
+  }
+  // fallback للاشتراكات القديمة: الجمعة (6) تُرفض إلا لو الباقة تشملها
+  if (dayIdx === 6) return sub.fridays === true;
+  return true;
+};
+
 export const getSubscriptionStatus = (sub) => {
   // Kuwait timezone (UTC+3)
   const now = new Date();
   const kwDate = new Date(now.getTime() + 3 * 60 * 60 * 1000);
   const today = kwDate.toISOString().split('T')[0];
   if (sub.status === 'cancelled') return 'cancelled';
+  if (sub.status === 'paused') return 'paused';
   if (sub.endDate < today) return 'expired';
   if (sub.startDate > today) return 'upcoming';
   return 'active';

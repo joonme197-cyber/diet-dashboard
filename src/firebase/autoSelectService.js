@@ -3,9 +3,10 @@ import {
   doc, getDoc, setDoc, getDocs,
   collection, serverTimestamp
 } from 'firebase/firestore';
-import { MEALS_DATA, getMenuDay, saveClientDailyMeals, getClientDailyMeals } from './mealService';
+import { MEALS_DATA, getMenuDay, saveClientDailyMeals, getClientDailyMeals, getMeals } from './mealService';
 import { getAllSubscriptions, getSubscriptionStatus } from './subscriptionService';
 import { getClients } from './clientService';
+import { getPackages } from './packageService';
 
 const SETTINGS_DOC = 'autoSelectSettings';
 const LOG_DOC      = 'autoSelectLog';
@@ -65,7 +66,7 @@ const getCycleDayKey = (startDate, targetDate) => {
 // ─────────────────────────────────────────────
 // اختيار وجبات من منيو الشيف
 // ─────────────────────────────────────────────
-const autoSelectMealsForClient = async (clientId, deliveryDate, activeSub) => {
+const autoSelectMealsForClient = async (clientId, deliveryDate, activeSub, allMeals) => {
   const existing = await getClientDailyMeals(clientId, deliveryDate) || {
     افطار: [], غداء: [], عشاء: [], سناك: []
   };
@@ -77,7 +78,7 @@ const autoSelectMealsForClient = async (clientId, deliveryDate, activeSub) => {
   if (!menuDay?.meals?.length) return false;
 
   const meals = menuDay.meals
-    .map(id => MEALS_DATA.find(m => m.id === id))
+    .map(id => allMeals.find(m => m.id === id) || MEALS_DATA.find(m => m.id === id))
     .filter(Boolean);
 
   // ── 1. الأنواع المسموحة ──
@@ -107,31 +108,56 @@ const autoSelectMealsForClient = async (clientId, deliveryDate, activeSub) => {
     سناك:  meals.filter(m => m.mealType === 'سناك'),
   };
 
-  // ── 4. بناء الاختيارات ملتزماً بالأعداد المحددة ──
-  const buildType = (type) => {
-    if (!allowMap[type]) return []; // النوع مش مسموح
+  // ── 4. بناء الاختيارات مع مراعاة الحد الكلي للوجبات ──
+  const mealsLimit = activeSub.mealsNumber ?? 999; // إجمالي وجبات الباقة اليومية
+  let mealsBudget  = mealsLimit;
 
-    const target       = maxPerType[type];
-    if (target === 0)  return []; // عدده صفر
+  // استهلك ما هو موجود مسبقاً من الوجبات الرئيسية
+  const existingMealsTotal =
+    (existing['افطار']?.length || 0) +
+    (existing['غداء']?.length  || 0) +
+    (existing['عشاء']?.length  || 0);
+  mealsBudget = Math.max(0, mealsLimit - existingMealsTotal);
+
+  const buildMealType = (type) => {
+    if (!allowMap[type]) return [];
+    const perTypeMax = maxPerType[type];
+    if (perTypeMax === 0) return [];
 
     const currentCount = (existing[type] || []).length;
-    if (currentCount >= target) return existing[type] || []; // موجود كافي
+    // الحد الفعلي = أقل قيمة بين حد النوع والميزانية المتبقية
+    const effectiveTarget = Math.min(perTypeMax, currentCount + mealsBudget);
+    if (currentCount >= effectiveTarget) return existing[type] || [];
 
-    // أضف الناقص من المنيو
     const existingIds = (existing[type] || []).map(m => m.id);
     const toAdd = availableByType[type]
       .filter(m => !existingIds.includes(m.id))
-      .slice(0, target - currentCount)
+      .slice(0, effectiveTarget - currentCount)
       .map(m => ({ id: m.id, title: m.mealTitle }));
 
+    mealsBudget -= toAdd.length; // خصم ما تمت إضافته من الميزانية
     return [...(existing[type] || []), ...toAdd];
   };
 
+  const buildSnack = () => {
+    if (!allowMap['سناك']) return [];
+    const target = maxPerType['سناك'];
+    if (target === 0) return [];
+    const currentCount = (existing['سناك'] || []).length;
+    if (currentCount >= target) return existing['سناك'] || [];
+    const existingIds = (existing['سناك'] || []).map(m => m.id);
+    const toAdd = availableByType['سناك']
+      .filter(m => !existingIds.includes(m.id))
+      .slice(0, target - currentCount)
+      .map(m => ({ id: m.id, title: m.mealTitle }));
+    return [...(existing['سناك'] || []), ...toAdd];
+  };
+
   const selections = {
-    افطار: buildType('افطار'),
-    غداء:  buildType('غداء'),
-    عشاء:  buildType('عشاء'),
-    سناك:  buildType('سناك'),
+    افطار: buildMealType('افطار'),
+    غداء:  buildMealType('غداء'),
+    عشاء:  buildMealType('عشاء'),
+    سناك:  buildSnack(),
   };
 
   const totalExisting = Object.values(existing).reduce((s, a) => s + a.length, 0);
@@ -160,9 +186,11 @@ export const runAutoSelect = async (manual = false) => {
   const details = [];
 
   try {
-    const [clients, allSubs] = await Promise.all([
+    const [clients, allSubs, allMeals, allPackages] = await Promise.all([
       getClients(),
       getAllSubscriptions(),
+      getMeals(),
+      getPackages(),
     ]);
 
     for (const client of clients) {
@@ -178,7 +206,34 @@ export const runAutoSelect = async (manual = false) => {
           continue;
         }
 
-        const didSelect = await autoSelectMealsForClient(client.id, deliveryDate, activeSub);
+        // تخطى لو اليوم مجمّد في الاشتراك
+        if ((activeSub.frozenDays || []).includes(deliveryDate)) {
+          skipped++;
+          continue;
+        }
+
+        // تحقق من أيام التوصيل المفعّلة في الاشتراك
+        // deliveryDays: [0=سبت, 1=أحد, ..., 6=جمعة]
+        const jsToSysDay = [1, 2, 3, 4, 5, 6, 0]; // JS getDay() → ترتيب النظام
+        const deliveryDayIdx = jsToSysDay[new Date(deliveryDate).getDay()];
+
+        if (activeSub.deliveryDays?.length > 0) {
+          if (!activeSub.deliveryDays.includes(deliveryDayIdx)) {
+            skipped++;
+            continue;
+          }
+        } else {
+          // fallback للاشتراكات القديمة: تحقق من الجمعة عبر الباقة
+          if (deliveryDayIdx === 6) {
+            const pkg = allPackages.find(p => p.id === activeSub.packageId);
+            if (pkg?.fridays !== true) {
+              skipped++;
+              continue;
+            }
+          }
+        }
+
+        const didSelect = await autoSelectMealsForClient(client.id, deliveryDate, activeSub, allMeals);
         if (didSelect) {
           processed++;
           details.push({ clientId: client.id, name: client.name, date: deliveryDate, status: 'auto-selected' });
@@ -220,6 +275,18 @@ export const runAutoSelect = async (manual = false) => {
   ]);
 
   return logEntry;
+};
+
+// ─────────────────────────────────────────────
+// اختيار وجبات لعميل محدد بعد إلغاء التجميد
+// ─────────────────────────────────────────────
+export const runAutoSelectForClient = async (clientId, dateStr, activeSub) => {
+  try {
+    const allMeals = await getMeals();
+    await autoSelectMealsForClient(clientId, dateStr, activeSub, allMeals);
+  } catch (e) {
+    console.warn('runAutoSelectForClient error:', e);
+  }
 };
 
 // ─────────────────────────────────────────────

@@ -2,8 +2,67 @@ import { db } from './config';
 import {
   collection, addDoc, getDocs, doc,
   deleteDoc, updateDoc, setDoc, getDoc,
-  query, orderBy, serverTimestamp
+  query, orderBy, serverTimestamp, where
 } from 'firebase/firestore';
+
+// ── Cache بسيط ──
+const _cache = {};
+const TTL = 5 * 60 * 1000;
+const cached = async (key, fn) => {
+  const now = Date.now();
+  if (_cache[key] && now - _cache[key].ts < TTL) return _cache[key].data;
+  const data = await fn();
+  _cache[key] = { data, ts: now };
+  return data;
+};
+export const clearMealCache = (key) => {
+  if (key) delete _cache[key];
+  else Object.keys(_cache).forEach(k => delete _cache[k]);
+};
+
+// =====================
+// إدارة المنيوات (Multi-Menu)
+// =====================
+
+// جلب كل المنيوات
+export const getMenus = async () => {
+  return cached('menus', async () => {
+    const snap = await getDocs(query(collection(db, 'menus'), orderBy('createdAt', 'asc')));
+    return snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  });
+};
+
+// جلب المنيو النشط
+export const getActiveMenu = async () => {
+  const snap = await getDocs(query(collection(db, 'menus'), where('isActive', '==', true)));
+  if (!snap.empty) return { id: snap.docs[0].id, ...snap.docs[0].data() };
+  // fallback — المنيو الافتراضي القديم
+  return { id: 'default', nameAr: 'المنيو الافتراضي', nameEn: 'Default Menu', isActive: true };
+};
+
+// إضافة منيو جديد
+export const addMenu = async (data) => {
+  return await addDoc(collection(db, 'menus'), { ...data, createdAt: serverTimestamp() });
+};
+
+// تحديث منيو
+export const updateMenu = async (id, data) => {
+  await updateDoc(doc(db, 'menus', id), { ...data, updatedAt: serverTimestamp() });
+};
+
+// حذف منيو
+export const deleteMenu = async (id) => {
+  await deleteDoc(doc(db, 'menus', id));
+};
+
+// تفعيل منيو (وإيقاف البقية)
+export const activateMenu = async (menuId) => {
+  const menus = await getMenus();
+  const promises = menus.map(m =>
+    updateDoc(doc(db, 'menus', m.id), { isActive: m.id === menuId })
+  );
+  await Promise.all(promises);
+};
 
 // =====================
 // بيانات الوجبات الكاملة (104 وجبة)
@@ -146,28 +205,39 @@ for (let w = 1; w <= 4; w++) {
 }
 
 // حفظ منيو يوم معين
-export const saveMenuDay = async (menuType, dayKey, meals) => {
-  // menuType = 'default' or 'chef'
-  await setDoc(doc(db, 'menuSettings', `${menuType}_${dayKey}`), {
-    menuType, dayKey, meals, updatedAt: serverTimestamp()
+export const saveMenuDay = async (menuType, dayKey, meals, menuId = 'default') => {
+  const docId = `${menuId}_${menuType}_${dayKey}`;
+  await setDoc(doc(db, 'menuSettings', docId), {
+    menuId, menuType, dayKey, meals, updatedAt: serverTimestamp()
   });
+  // امسح الـ cache عشان يتحدث
+  clearMealCache(`fullmenu_${menuId}_${menuType}`);
+  clearMealCache(`menu_${menuId}_${menuType}_${dayKey}`);
 };
 
 // جلب منيو يوم معين
-export const getMenuDay = async (menuType, dayKey) => {
-  const snap = await getDoc(doc(db, 'menuSettings', `${menuType}_${dayKey}`));
-  return snap.exists() ? snap.data() : null;
+export const getMenuDay = async (menuType, dayKey, menuId = 'default') => {
+  // أول نجرب بالـ menuId الجديد
+  const snap = await getDoc(doc(db, 'menuSettings', `${menuId}_${menuType}_${dayKey}`));
+  if (snap.exists()) return snap.data();
+  // fallback للـ format القديم (backward compat)
+  const oldSnap = await getDoc(doc(db, 'menuSettings', `${menuType}_${dayKey}`));
+  return oldSnap.exists() ? oldSnap.data() : null;
 };
 
-// جلب كل منيو (default أو chef)
-export const getFullMenu = async (menuType) => {
-  const snap = await getDocs(collection(db, 'menuSettings'));
-  const result = {};
-  snap.docs.forEach(d => {
-    const data = d.data();
-    if (data.menuType === menuType) result[data.dayKey] = data.meals;
+// جلب كل منيو (default أو chef) لمنيو معين
+export const getFullMenu = async (menuType, menuId = 'default') => {
+  return cached(`fullmenu_${menuId}_${menuType}`, async () => {
+    const snap = await getDocs(collection(db, 'menuSettings'));
+    const result = {};
+    snap.docs.forEach(d => {
+      const data = d.data();
+      const matchNew = data.menuId === menuId && data.menuType === menuType;
+      const matchOld = !data.menuId && menuId === 'default' && data.menuType === menuType;
+      if (matchNew || matchOld) result[data.dayKey] = data.meals;
+    });
+    return result;
   });
-  return result;
 };
 
 // =====================
@@ -197,3 +267,135 @@ export const getClientAllMeals = async (clientId) => {
     .filter(d => d.data().clientId === clientId)
     .map(d => d.data());
 };
+
+// =====================
+// استيراد المنيو من Excel
+// =====================
+export const importMenuFromExcel = async (file, menuType, menuId = 'default', allMeals = []) => {
+  const XLSX = await import('xlsx');
+  const data = await file.arrayBuffer();
+  const workbook = XLSX.read(data, { type: 'array' });
+  const sheet = workbook.Sheets[workbook.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1 });
+
+  // تخطي الهيدر
+  const dataRows = rows.slice(1).filter(r => r && r.length > 0);
+
+  const DAYS = ['السبت','الأحد','الاثنين','الثلاثاء','الأربعاء','الخميس','الجمعة'];
+  const MEAL_TYPES_ORDER = ['افطار','غداء','عشاء','سناك'];
+
+  // بناء خريطة الوجبات بالاسم → id
+  const mealMap = {};
+  allMeals.forEach(m => {
+    if (m.mealTitle) mealMap[m.mealTitle.trim()] = m.id;
+    if (m.mealTitleEn) mealMap[m.mealTitleEn.trim().toLowerCase()] = m.id;
+  });
+
+  let savedDays = 0;
+  let skippedMeals = [];
+
+  for (const row of dataRows) {
+    const weekText = String(row[0] || '').trim();
+    const dayText  = String(row[1] || '').trim();
+
+    // استخراج رقم الأسبوع
+    const weekMatch = weekText.match(/(\d+)/);
+    const weekNum = weekMatch ? parseInt(weekMatch[1]) : null;
+    if (!weekNum || weekNum < 1 || weekNum > 4) continue;
+
+    // التحقق من اليوم
+    const dayIdx = DAYS.indexOf(dayText);
+    if (dayIdx === -1) continue;
+
+    const dayKey = `w${weekNum}_${dayText}`;
+    const mealIds = [];
+
+    // كل نوع وجبة له 3 أعمدة (col 2,3,4 = فطور1,فطور2,فطور3 ... إلخ)
+    for (let typeIdx = 0; typeIdx < MEAL_TYPES_ORDER.length; typeIdx++) {
+      for (let slot = 0; slot < 3; slot++) {
+        const colIdx = 2 + typeIdx * 3 + slot;
+        const cellVal = String(row[colIdx] || '').trim();
+        if (!cellVal) continue;
+
+        // بحث عن الوجبة بالاسم
+        const mealId = mealMap[cellVal] || mealMap[cellVal.toLowerCase()];
+        if (mealId) {
+          if (!mealIds.includes(mealId)) mealIds.push(mealId);
+        } else {
+          skippedMeals.push({ day: dayKey, meal: cellVal });
+        }
+      }
+    }
+
+    if (mealIds.length > 0) {
+      await saveMenuDay(menuType, dayKey, mealIds, menuId);
+      savedDays++;
+    }
+  }
+
+  // تنظيف الكاش
+  clearMealCache(`fullmenu_${menuId}_${menuType}`);
+
+  return { savedDays, skippedMeals };
+};
+
+// تحميل سامبل المنيو مع الوجبات الحالية
+export const generateMenuSampleExcel = async (allMeals = []) => {
+  const XLSX = await import('xlsx');
+
+  const DAYS = ['السبت','الأحد','الاثنين','الثلاثاء','الأربعاء','الخميس','الجمعة'];
+  const MEAL_TYPES = ['افطار','غداء','عشاء','سناك'];
+  const MEAL_ICONS = { افطار:'🍳', غداء:'🍛', عشاء:'🌙', سناك:'🥗' };
+
+  // الشيت الرئيسي
+  const headers = ['الأسبوع', 'اليوم'];
+  MEAL_TYPES.forEach(mt => {
+    headers.push(`${MEAL_ICONS[mt]} ${mt} 1`);
+    headers.push(`${MEAL_ICONS[mt]} ${mt} 2`);
+    headers.push(`${MEAL_ICONS[mt]} ${mt} 3`);
+  });
+
+  const templateData = [headers];
+  for (let w = 1; w <= 4; w++) {
+    for (const d of DAYS) {
+      const row = [`الأسبوع ${w}`, d];
+      for (let i = 0; i < 12; i++) row.push('');
+      templateData.push(row);
+    }
+  }
+
+  // شيت قائمة الوجبات
+  const mealsListData = [MEAL_TYPES.map(mt => `${MEAL_ICONS[mt]} ${mt}`)];
+  const byType = {};
+  MEAL_TYPES.forEach(mt => byType[mt] = []);
+  allMeals.forEach(m => {
+    if (byType[m.mealType]) byType[m.mealType].push(m.mealTitle);
+  });
+  const maxLen = Math.max(...Object.values(byType).map(a => a.length), 1);
+  for (let i = 0; i < maxLen; i++) {
+    mealsListData.push(MEAL_TYPES.map(mt => byType[mt][i] || ''));
+  }
+
+  const wb = XLSX.utils.book_new();
+  const ws1 = XLSX.utils.aoa_to_sheet(templateData);
+  const ws2 = XLSX.utils.aoa_to_sheet(mealsListData);
+
+  // عرض الأعمدة
+  ws1['!cols'] = [{ wch:12 }, { wch:12 }, ...Array(12).fill({ wch:28 })];
+  ws2['!cols'] = Array(4).fill({ wch:35 });
+
+  XLSX.utils.book_append_sheet(wb, ws1, 'Menu Template');
+  XLSX.utils.book_append_sheet(wb, ws2, 'قائمة الوجبات');
+
+  const buffer = XLSX.write(wb, { bookType:'xlsx', type:'array' });
+  const blob = new Blob([buffer], { type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+
+  // تحميل تلقائي
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'menu_sample.xlsx';
+  a.click();
+  URL.revokeObjectURL(url);
+};
+
